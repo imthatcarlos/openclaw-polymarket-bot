@@ -101,23 +101,40 @@ export function generateSignal(
     const absDelta = Math.abs(delta);
     const absDeltaPct = Math.abs(deltaPct);
 
+    // Time into window (0-300s). Later = more reliable signal (less time for reversal)
+    const now = Math.floor(Date.now() / 1000);
+    const windowStart = Math.floor(now / 300) * 300;
+    const timeInWindow = now - windowStart;
+    const timeWeight = Math.max(0.5, timeInWindow / 300); // 0.5 at start, 1.0 at end
+
     if (absDeltaPct >= config.minPriceDeltaPercent && absDelta >= config.minPriceDeltaAbsolute) {
       const arbDirection: Direction = delta > 0 ? "UP" : "DOWN";
-      const expectedFairPrice = delta > 0 ? 0.65 + (absDeltaPct * 5) : 0.65 + (absDeltaPct * 5); // rough fair value
+      // Conservative fair value: base 0.50 + small multiplier, scaled by time in window
+      // A move at minute 4 is worth more than a move at minute 1
+      const rawFair = 0.50 + (absDeltaPct * 2 * timeWeight);
+      const expectedFairPrice = Math.min(rawFair, 0.85); // cap at 85%, never assume certainty
       const currentTokenPrice = arbDirection === "UP" ? marketUpPrice : marketDownPrice;
 
       // Edge = how much cheaper the token is vs our fair value estimate
-      const edge = Math.min(expectedFairPrice, 0.95) - currentTokenPrice;
+      const edge = expectedFairPrice - currentTokenPrice;
 
-      if (edge > 0.05) {
-        // Significant edge — market hasn't caught up
+      // POST-MORTEM LESSON (trade #12): Market priced DOWN at 0.49 for a -0.155% move.
+      // Our old model said 0.95 fair. Market was right. Now we:
+      // 1. Only arb if market implies <55% for our direction (token < 0.55)
+      // 2. Require 10¢+ edge (was 5¢)
+      // 3. Time-weight: early-window moves get discounted
+      const marketAlreadyPriced = currentTokenPrice >= 0.55;
+
+      if (edge > 0.10 && !marketAlreadyPriced) {
         direction = arbDirection;
         strategy = "latency-arb";
-        confidence = Math.min(0.9, config.arbMinConfidence + edge);
-        reasons.push(`LATENCY ARB: BTC ${delta > 0 ? "UP" : "DOWN"} $${absDelta.toFixed(0)} from open`);
-        reasons.push(`Token price: $${currentTokenPrice.toFixed(2)} vs est. fair: $${Math.min(expectedFairPrice, 0.95).toFixed(2)} (edge: ${(edge * 100).toFixed(0)}¢)`);
+        confidence = Math.min(0.9, config.arbMinConfidence + (edge * 0.5));
+        reasons.push(`LATENCY ARB: BTC ${delta > 0 ? "UP" : "DOWN"} $${absDelta.toFixed(0)} from open (${timeInWindow}s into window)`);
+        reasons.push(`Token: $${currentTokenPrice.toFixed(2)} vs fair: $${expectedFairPrice.toFixed(2)} (edge: ${(edge * 100).toFixed(0)}¢, time-weight: ${timeWeight.toFixed(2)})`);
+      } else if (marketAlreadyPriced) {
+        reasons.push(`Price moved $${absDelta.toFixed(0)} but market already priced in (token: $${currentTokenPrice.toFixed(2)} ≥ $0.55)`);
       } else {
-        reasons.push(`Price moved but market already priced in (token: $${currentTokenPrice.toFixed(2)}, no edge)`);
+        reasons.push(`Price moved $${absDelta.toFixed(0)} but edge too small (${(edge * 100).toFixed(0)}¢ < 10¢ min)`);
       }
     }
   }

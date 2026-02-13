@@ -4,7 +4,7 @@
  */
 
 import express from "express";
-import { readFileSync, writeFileSync, existsSync } from "fs";
+import { readFileSync, writeFileSync, existsSync, appendFileSync } from "fs";
 import { PriceEngine } from "./price-engine.js";
 import { findCurrentMarket, checkMarketOutcome, type MarketInfo } from "./market-engine.js";
 import { generateSignal, DEFAULT_CONFIG, type Signal, type SignalConfig, type Strategy } from "./signal-engine.js";
@@ -42,6 +42,27 @@ interface BotState {
   losses: number;
   skips: number;
   paused: boolean;
+}
+
+// ── Loss Pattern Categorization ─────────────────────────────
+function categorizeLoss(trade: Trade): string {
+  const reasons = trade.reasons.join(" ");
+  if (trade.strategy === "latency-arb") {
+    if (reasons.includes("into window")) {
+      const timeMatch = reasons.match(/(\d+)s into/);
+      const secs = timeMatch ? parseInt(timeMatch[1]) : 999;
+      if (secs < 180) return "ARB_TOO_EARLY"; // entered before 3 min, price reversed
+      return "ARB_REVERSAL"; // late entry but still reversed
+    }
+    return "ARB_MISPRICED"; // fair value estimate was wrong
+  }
+  if (reasons.includes("Exhaustion")) return "EXHAUSTION_MISSED";
+  if (reasons.includes("decelerat")) return "DECEL_MISSED";
+  if (reasons.includes("downtrend") && trade.direction === "UP") return "COUNTER_TREND";
+  if (reasons.includes("uptrend") && trade.direction === "DOWN") return "COUNTER_TREND";
+  if (reasons.includes("Oversold") && trade.direction === "DOWN") return "FALLING_KNIFE";
+  if (reasons.includes("Overbought") && trade.direction === "UP") return "CHASING_TOP";
+  return "UNKNOWN";
 }
 
 // ── State ───────────────────────────────────────────────────
@@ -141,6 +162,38 @@ async function settleTrades() {
     state.totalPnL += trade.pnl;
 
     console.log(`[settle] ${trade.market} | ${trade.direction} | ${trade.result.toUpperCase()} | P&L: $${trade.pnl.toFixed(2)} | Total: $${state.totalPnL.toFixed(2)}`);
+
+    // Post-mortem on every loss — log structured analysis for pattern detection
+    if (trade.result === "loss") {
+      const postMortem = {
+        timestamp: new Date().toISOString(),
+        trade: {
+          market: trade.market,
+          direction: trade.direction,
+          strategy: trade.strategy,
+          price: trade.price,
+          cost: trade.cost,
+          confidence: trade.confidence,
+          reasons: trade.reasons,
+        },
+        analysis: {
+          wasExhausted: trade.reasons.some(r => r.includes("Exhaustion")),
+          wasDecelerating: trade.reasons.some(r => r.includes("decelerat")),
+          wasLatencyArb: trade.strategy === "latency-arb",
+          timeInWindow: trade.reasons.find(r => r.includes("into window"))?.match(/(\d+)s into/)?.[1] || "unknown",
+          tokenPrice: trade.price,
+          pattern: categorizeLoss(trade),
+        },
+        totalPnL: state.totalPnL,
+        winRate: `${state.wins}W/${state.losses}L (${((state.wins / (state.wins + state.losses)) * 100).toFixed(1)}%)`,
+      };
+      const PM_FILE = new URL("../post-mortems.jsonl", import.meta.url).pathname;
+      try {
+        appendFileSync(PM_FILE, JSON.stringify(postMortem) + "\n");
+        console.log(`[post-mortem] Loss logged: ${postMortem.analysis.pattern}`);
+      } catch {}
+    }
+
     saveState();
   }
 }
@@ -355,6 +408,23 @@ app.post("/config", (req, res) => {
   saveState();
   console.log("[bot] Config updated:", applied);
   res.json({ ok: true, applied, config: state.config });
+});
+
+app.get("/post-mortems", (_req, res) => {
+  const PM_FILE = new URL("../post-mortems.jsonl", import.meta.url).pathname;
+  try {
+    const lines = readFileSync(PM_FILE, "utf-8").trim().split("\n").filter(Boolean);
+    const pms = lines.map(l => JSON.parse(l));
+    // Pattern frequency
+    const patterns: Record<string, number> = {};
+    for (const pm of pms) {
+      const p = pm.analysis?.pattern || "UNKNOWN";
+      patterns[p] = (patterns[p] || 0) + 1;
+    }
+    res.json({ count: pms.length, patterns, recent: pms.slice(-5).reverse() });
+  } catch {
+    res.json({ count: 0, patterns: {}, recent: [] });
+  }
 });
 
 app.post("/stop", (_req, res) => {
