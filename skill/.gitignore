@@ -1,0 +1,3 @@
+node_modules/
+scripts/bot-force-test.ts
+.traded-windows.json

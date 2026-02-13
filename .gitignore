@@ -1,0 +1,9 @@
+node_modules/
+skill/node_modules/
+.bot.pid
+bot.log
+*.log
+state.json
+bot.log
+.bot.pid
+.env

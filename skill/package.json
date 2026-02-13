@@ -1,0 +1,17 @@
+{
+  "name": "polymarket-btc-skill",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "bot": "tsx scripts/bot.ts",
+    "bot:dry": "tsx scripts/bot.ts --dry-run"
+  },
+  "dependencies": {
+    "@polymarket/clob-client": "^4",
+    "ethers": "^5.8.0"
+  },
+  "devDependencies": {
+    "tsx": "^4",
+    "typescript": "^5"
+  }
+}
