@@ -343,7 +343,8 @@ app.post("/resume", (_req, res) => {
 
 app.post("/config", (req, res) => {
   const allowed = ["oversoldThreshold", "overboughtThreshold", "extremeOversold",
-    "extremeOverbought", "minConfidence", "maxPrice", "dryRun", "positionSize"];
+    "extremeOverbought", "minConfidence", "maxPrice", "dryRun", "positionSize",
+    "cooldownWindows", "minPriceDeltaPercent", "minPriceDeltaAbsolute", "arbMinConfidence"];
   const applied: Record<string, any> = {};
   for (const key of allowed) {
     if (key in req.body) {

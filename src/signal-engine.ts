@@ -127,27 +127,51 @@ export function generateSignal(
     reasons.push(`K=${lastK.toFixed(1)} D=${lastD.toFixed(1)} RSI=${lastRSI.toFixed(1)}`);
     reasons.push(`Mom3=${mom3.toFixed(3)}% Mom5=${mom5.toFixed(3)}% EMA20=${trendUp ? "UP" : "DOWN"}`);
 
+    // ── Anti-exhaustion filter ──
+    // If K has been pinned extreme for 3+ consecutive candles, a reversal is imminent.
+    // Check last 3 closes via StochRSI proxy: if current K is extreme AND momentum
+    // is decelerating, the move is exhausted.
+    const kExhaustedLow = lastK < 15 && mom3 > mom5;  // oversold but momentum flattening
+    const kExhaustedHigh = lastK > 85 && mom3 < mom5;  // overbought but momentum flattening
+
+    if (kExhaustedLow) reasons.push("⚠️ Exhaustion: K pinned low but momentum fading");
+    if (kExhaustedHigh) reasons.push("⚠️ Exhaustion: K pinned high but momentum fading");
+
+    // ── Deceleration veto ──
+    // If momentum is decelerating against the trade direction, skip.
+    // For UP: accel should be positive (speeding up). For DOWN: accel should be negative.
+    const upDecelVeto = momAccel < -0.02;   // momentum decelerating — bad for UP
+    const downDecelVeto = momAccel > 0.02;  // momentum decelerating — bad for DOWN
+
     // Tightened rules: NO trend-follow at extremes (that was losing)
-    // Only mean-reversion with trend confirmation
+    // Only mean-reversion with trend confirmation + exhaustion/decel guards
     if (lastK < config.oversoldThreshold && lastK > lastD) {
-      if (trendUp && mom5 > -0.05) {
+      if (kExhaustedLow) {
+        reasons.push("Oversold but exhausted — skipping (reversal imminent, don't chase)");
+      } else if (upDecelVeto) {
+        reasons.push("Oversold crossover but momentum decelerating — veto");
+      } else if (trendUp && mom5 > -0.05) {
         direction = "UP";
         strategy = "technical";
         confidence = 0.65;
         reasons.push("Oversold K/D crossover + uptrend confirmed");
         if (lastRSI < 30) { confidence += 0.1; reasons.push("RSI confirms oversold"); }
-        if (momAccel > 0) { confidence += 0.1; reasons.push("Momentum accelerating"); }
+        if (momAccel > 0.01) { confidence += 0.1; reasons.push("Momentum accelerating"); }
       } else {
         reasons.push("Oversold but downtrend — skipping (no falling knives)");
       }
     } else if (lastK > config.overboughtThreshold && lastK < lastD) {
-      if (!trendUp && mom5 < 0.05) {
+      if (kExhaustedHigh) {
+        reasons.push("Overbought but exhausted — skipping (reversal imminent)");
+      } else if (downDecelVeto) {
+        reasons.push("Overbought crossover but momentum decelerating — veto");
+      } else if (!trendUp && mom5 < 0.05) {
         direction = "DOWN";
         strategy = "technical";
         confidence = 0.65;
         reasons.push("Overbought K/D crossover + downtrend confirmed");
         if (lastRSI > 70) { confidence += 0.1; reasons.push("RSI confirms overbought"); }
-        if (momAccel < 0) { confidence += 0.1; reasons.push("Momentum decelerating"); }
+        if (momAccel < -0.01) { confidence += 0.1; reasons.push("Momentum accelerating down"); }
       } else {
         reasons.push("Overbought but uptrend — skipping");
       }
