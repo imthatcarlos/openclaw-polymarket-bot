@@ -1,6 +1,11 @@
 #!/bin/bash
 cd "$(dirname "$0")"
 
+# Load .env if it exists
+if [ -f .env ]; then
+  set -a; source .env; set +a
+fi
+
 # Kill existing if running
 if [ -f .bot.pid ] && kill -0 "$(cat .bot.pid)" 2>/dev/null; then
   echo "Bot already running (PID $(cat .bot.pid)). Stop first."
