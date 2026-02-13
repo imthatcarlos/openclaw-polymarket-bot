@@ -28,8 +28,8 @@ export interface SignalConfig {
 }
 
 export const DEFAULT_CONFIG: SignalConfig = {
-  oversoldThreshold: 15,
-  overboughtThreshold: 85,
+  oversoldThreshold: 25,
+  overboughtThreshold: 75,
   extremeOversold: 10,
   extremeOverbought: 90,
   minConfidence: 0.6,
@@ -64,7 +64,7 @@ export function generateSignal(
   reasons.push(`Mom3=${mom3.toFixed(3)}% Mom5=${mom5.toFixed(3)}% Accel=${momAccel > 0 ? "+" : ""}${momAccel.toFixed(4)}%`);
   reasons.push(`EMA20=$${ema20.toFixed(2)} Trend=${trendUp ? "UP" : "DOWN"}`);
 
-  // Signal logic: trend-aligned only
+  // Signal logic: trend-aligned, with trend-following at extremes
   if (lastK < config.oversoldThreshold && lastK > lastD) {
     // Bullish crossover from oversold — only if uptrend
     if (trendUp && mom5 > -0.05) {
@@ -84,26 +84,43 @@ export function generateSignal(
       reasons.push("Overbought K/D crossover + downtrend confirmed");
       if (lastRSI > 70) { confidence += 0.1; reasons.push("RSI confirms overbought"); }
       if (momAccel < 0) { confidence += 0.1; reasons.push("Momentum decelerating"); }
+    } else if (trendUp && mom5 > 0.05 && mom3 > 0) {
+      // Trend-following: overbought but strong uptrend — ride the wave
+      direction = "UP";
+      confidence = 0.65;
+      reasons.push(`Overbought but strong uptrend — trend-follow UP (Mom5=${mom5.toFixed(3)}%)`);
+      if (momAccel > 0) { confidence += 0.1; reasons.push("Momentum still accelerating"); }
     } else {
-      reasons.push(`Overbought crossover but uptrend — skipping (don't short the rip)`);
+      reasons.push(`Overbought crossover but uptrend without strong momentum — skipping`);
     }
   } else if (lastK < config.extremeOversold) {
-    // Extreme oversold — triple confirmation
+    // Extreme oversold
     if (trendUp && mom3 > 0 && momAccel > 0) {
       direction = "UP";
       confidence = 0.75;
       reasons.push(`Extreme oversold (K=${lastK.toFixed(1)}) + uptrend + momentum accelerating`);
+    } else if (!trendUp && mom5 < -0.05 && mom3 < 0) {
+      // Trend-following: extreme oversold in strong downtrend — ride it down
+      direction = "DOWN";
+      confidence = 0.65;
+      reasons.push(`Extreme oversold but strong downtrend — trend-follow DOWN (Mom5=${mom5.toFixed(3)}%)`);
     } else {
-      reasons.push(`Extreme oversold but no triple confirmation`);
+      reasons.push(`Extreme oversold but no confirmation`);
     }
   } else if (lastK > config.extremeOverbought) {
-    // Extreme overbought — triple confirmation
+    // Extreme overbought
     if (!trendUp && mom3 < 0 && momAccel < 0) {
       direction = "DOWN";
       confidence = 0.75;
       reasons.push(`Extreme overbought (K=${lastK.toFixed(1)}) + downtrend + momentum decelerating`);
+    } else if (trendUp && mom5 > 0.05 && mom3 > 0) {
+      // Trend-following: extreme overbought in strong uptrend — ride it up
+      direction = "UP";
+      confidence = 0.7;
+      reasons.push(`Extreme overbought but strong uptrend — trend-follow UP (Mom5=${mom5.toFixed(3)}%)`);
+      if (momAccel > 0) { confidence += 0.1; reasons.push("Momentum accelerating into pump"); }
     } else {
-      reasons.push(`Extreme overbought but no triple confirmation`);
+      reasons.push(`Extreme overbought but no confirmation`);
     }
   } else {
     reasons.push("Neutral zone — no signal");
