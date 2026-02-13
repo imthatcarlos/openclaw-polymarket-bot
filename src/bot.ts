@@ -7,7 +7,7 @@ import express from "express";
 import { readFileSync, writeFileSync, existsSync } from "fs";
 import { PriceEngine } from "./price-engine.js";
 import { findCurrentMarket, checkMarketOutcome, type MarketInfo } from "./market-engine.js";
-import { generateSignal, DEFAULT_CONFIG, type Signal, type SignalConfig } from "./signal-engine.js";
+import { generateSignal, DEFAULT_CONFIG, type Signal, type SignalConfig, type Strategy } from "./signal-engine.js";
 import { ClobClient } from "@polymarket/clob-client";
 import { ethers } from "ethers";
 
@@ -23,6 +23,7 @@ interface Trade {
   market: string;
   windowStart: number;
   direction: "UP" | "DOWN";
+  strategy: Strategy;
   price: number;
   size: number;
   cost: number;
@@ -88,6 +89,7 @@ const state = loadState();
 const priceEngine = new PriceEngine();
 let clobClient: any = null;
 let lastTradedWindow = 0;
+let windowOpenPrices: Map<number, number> = new Map();
 let startedAt = Date.now();
 
 // ── CLOB Client (via EU proxy) ──────────────────────────────
@@ -155,11 +157,27 @@ async function checkAndTrade() {
     const currentWindowStart = Math.floor(now / 300) * 300;
     const timeIntoWindow = now - currentWindowStart;
 
+    // Track window open price (first price we see in each window)
+    if (!windowOpenPrices.has(currentWindowStart) && priceEngine.lastBinancePrice > 0) {
+      windowOpenPrices.set(currentWindowStart, priceEngine.lastBinancePrice);
+      // Cleanup old entries
+      for (const [k] of windowOpenPrices) {
+        if (k < currentWindowStart - 3600) windowOpenPrices.delete(k);
+      }
+    }
+
     // Already traded this window
     if (lastTradedWindow === currentWindowStart) return;
 
-    // Skip if >3 min in
-    if (timeIntoWindow > 180) return;
+    // Cooldown: skip N windows after last trade
+    if (state.config.cooldownWindows > 0 && lastTradedWindow > 0) {
+      const windowsSinceTrade = (currentWindowStart - lastTradedWindow) / 300;
+      if (windowsSinceTrade <= state.config.cooldownWindows) return;
+    }
+
+    // Skip if >3 min in (for technical). Arb can trade later (up to 4 min)
+    const maxTimeForTechnical = 180;
+    const maxTimeForArb = 240;
 
     // Need enough candles
     const closes = priceEngine.getCloses();
@@ -168,23 +186,37 @@ async function checkAndTrade() {
       return;
     }
 
-    // Generate signal
-    const signal = generateSignal(closes, state.config);
+    // Find market first (we need prices for arb signal)
+    const market = timeIntoWindow <= maxTimeForArb ? await findCurrentMarket() : null;
+
+    // Generate signal with market prices for latency arb
+    const windowOpen = windowOpenPrices.get(currentWindowStart) || null;
+    const signal = generateSignal(
+      closes,
+      windowOpen,
+      priceEngine.lastBinancePrice,
+      market?.upPrice ?? null,
+      market?.downPrice ?? null,
+      state.config
+    );
+
+    // Technical signals need earlier entry
+    if (signal.strategy === "technical" && timeIntoWindow > maxTimeForTechnical) {
+      state.skips++;
+      return;
+    }
 
     if (!signal.direction) {
       state.skips++;
       return;
     }
 
-    // Find market
-    const market = await findCurrentMarket();
     if (!market) {
       console.log("[bot] Market not found");
       return;
     }
 
     // Calculate order
-    const outcomeName = signal.direction;
     const currentPrice = signal.direction === "UP" ? market.upPrice : market.downPrice;
     const bidPrice = Math.min(parseFloat((currentPrice + 0.02).toFixed(2)), state.config.maxPrice);
     const size = Math.floor(state.config.positionSize / bidPrice);
@@ -193,7 +225,7 @@ async function checkAndTrade() {
     const cost = size * bidPrice;
     const tokenId = signal.direction === "UP" ? market.upTokenId : market.downTokenId;
 
-    console.log(`\n[bot] 🎯 ${signal.direction} | conf=${(signal.confidence * 100).toFixed(0)}% | ${size} tokens @ $${bidPrice} = $${cost.toFixed(2)}`);
+    console.log(`\n[bot] 🎯 ${signal.direction} [${signal.strategy}] | conf=${(signal.confidence * 100).toFixed(0)}% | ${size} tokens @ $${bidPrice} = $${cost.toFixed(2)}`);
     signal.reasons.forEach(r => console.log(`  → ${r}`));
 
     const trade: Trade = {
@@ -201,6 +233,7 @@ async function checkAndTrade() {
       market: market.slug,
       windowStart: currentWindowStart,
       direction: signal.direction,
+      strategy: signal.strategy,
       price: bidPrice,
       size,
       cost,
@@ -223,7 +256,6 @@ async function checkAndTrade() {
         console.log(`[bot] ✅ Order placed: ${trade.orderId}`);
       } catch (e: any) {
         console.error(`[bot] ❌ Order failed: ${e.message}`);
-        trade.result = "pending"; // still mark as attempted
       }
     } else {
       console.log("[bot] 🏜️ DRY RUN");
@@ -245,7 +277,10 @@ app.use(express.json());
 
 app.get("/status", (_req, res) => {
   const closes = priceEngine.getCloses();
-  const lastSignal = closes.length >= 30 ? generateSignal(closes, state.config) : null;
+  const nowSec = Math.floor(Date.now() / 1000);
+  const cwStart = Math.floor(nowSec / 300) * 300;
+  const wop = windowOpenPrices.get(cwStart) || null;
+  const lastSignal = closes.length >= 30 ? generateSignal(closes, wop, priceEngine.lastBinancePrice, null, null, state.config) : null;
 
   res.json({
     running: true,
@@ -260,9 +295,11 @@ app.get("/status", (_req, res) => {
     connections: priceEngine.connected,
     signal: lastSignal ? {
       direction: lastSignal.direction,
+      strategy: lastSignal.strategy,
       confidence: `${(lastSignal.confidence * 100).toFixed(0)}%`,
       k: lastSignal.stochRSI.k.toFixed(1),
       d: lastSignal.stochRSI.d.toFixed(1),
+      priceDelta: lastSignal.priceDelta ? `$${lastSignal.priceDelta.absolute.toFixed(2)} (${lastSignal.priceDelta.percent.toFixed(3)}%)` : null,
       reasons: lastSignal.reasons,
     } : null,
     stats: {
