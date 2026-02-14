@@ -59,10 +59,10 @@ export const DEFAULT_CONFIG: SignalConfig = {
   minEdgeCents: 8,            // need 8¢+ edge
   maxTokenPrice: 0.55,        // skip if market already >55% for our direction
 
-  // Conservative fair value: 0.50 + (deltaPct * 2.5 * timeWeight)
+  // Conservative fair value: 0.50 + (deltaPct * 1.5 * timeWeight)
   fairValueBase: 0.50,
-  fairValueMultiplier: 2.5,
-  fairValueCap: 0.80,         // never estimate >80% certainty
+  fairValueMultiplier: 1.5,    // was 2.5, too aggressive — market was right on all 3 losses
+  fairValueCap: 0.75,          // was 0.80, cap lower
 
   // Trade params
   maxPrice: 0.65,
@@ -133,6 +133,13 @@ export function generateSignal(
   // ── Filters ──
   if (tokenPrice >= config.maxTokenPrice) {
     reasons.push(`SKIP: Market already priced in (${tokenPrice.toFixed(2)} >= ${config.maxTokenPrice})`);
+    return { direction: null, confidence: 0, reasons, priceDelta, marketPrices, timeInWindow, timestamp: Date.now() };
+  }
+
+  // POST-MORTEM: All 3 losses had token at 0.49-0.505 (market saying ~50/50 or slightly against us).
+  // Only enter when market at least slightly agrees with our direction (token >= 0.50).
+  if (tokenPrice < 0.50) {
+    reasons.push(`SKIP: Market disagrees (token $${tokenPrice.toFixed(2)} < $0.50 — market doesn't see this direction)`);
     return { direction: null, confidence: 0, reasons, priceDelta, marketPrices, timeInWindow, timestamp: Date.now() };
   }
 
