@@ -249,10 +249,28 @@ async function onTick(price: number) {
       return;
     }
 
-    // Execute trade — Kelly-sized
+    // Circuit breaker: pause if P&L drops below floor
+    const pnlFloor = state.config.pnlFloor ?? -100;
+    if (state.totalPnL <= pnlFloor) {
+      console.log(`[circuit-breaker] 🛑 P&L $${state.totalPnL.toFixed(2)} hit floor $${pnlFloor}. Auto-pausing.`);
+      state.paused = true;
+      saveState();
+      checking = false;
+      return;
+    }
+
+    // Execute trade — compounding position size
     const tokenPrice = signal.direction === "UP" ? market.upPrice : market.downPrice;
     const bidPrice = Math.min(parseFloat((tokenPrice + 0.02).toFixed(2)), state.config.maxPrice);
-    const tradeSize = signal.kellySize ?? state.config.positionSize;
+
+    // Compounding: base + percentage of profits, capped at ceiling
+    const baseSize = state.config.positionSize;
+    const compoundFraction = state.config.compoundFraction ?? 0.5; // reinvest 50% of profits
+    const maxPositionSize = state.config.maxPositionSize ?? 200; // ceiling
+    const profitBoost = state.totalPnL > 0 ? state.totalPnL * compoundFraction : 0;
+    const tradeSize = Math.min(baseSize + profitBoost, maxPositionSize);
+    console.log(`[compound] base=$${baseSize} + profit_boost=$${profitBoost.toFixed(2)} = $${tradeSize.toFixed(2)} (cap $${maxPositionSize})`);
+
     const size = Math.floor(tradeSize / bidPrice);
     if (size < 1) { checking = false; return; }
 
@@ -364,6 +382,10 @@ app.get("/status", (_req, res) => {
     },
     config: {
       positionSize: state.config.positionSize,
+      compoundFraction: state.config.compoundFraction ?? 0.5,
+      maxPositionSize: state.config.maxPositionSize ?? 200,
+      pnlFloor: state.config.pnlFloor ?? -100,
+      effectiveSize: `$${Math.min(state.config.positionSize + Math.max(0, state.totalPnL) * (state.config.compoundFraction ?? 0.5), state.config.maxPositionSize ?? 200).toFixed(2)}`,
       minDeltaPercent: state.config.minDeltaPercent,
       minDeltaAbsolute: state.config.minDeltaAbsolute,
       minEdgeCents: state.config.minEdgeCents,
@@ -437,7 +459,7 @@ app.post("/resume", (_req, res) => {
 });
 
 app.post("/config", (req, res) => {
-  const allowed = [...Object.keys(DEFAULT_CONFIG), "bankroll", "kellyFraction", "minPositionSize"];
+  const allowed = [...Object.keys(DEFAULT_CONFIG), "bankroll", "kellyFraction", "minPositionSize", "compoundFraction", "maxPositionSize", "pnlFloor"];
   const applied: Record<string, any> = {};
   for (const key of allowed) {
     if (key in req.body) {

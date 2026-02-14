@@ -54,6 +54,11 @@ export interface SignalConfig {
   
   // Cooldown
   cooldownMs: number;          // min ms between trades
+  
+  // Compounding & risk
+  compoundFraction: number;    // fraction of profits to reinvest (0.5 = 50%)
+  maxPositionSize: number;     // absolute ceiling for compounded position
+  pnlFloor: number;            // auto-pause if P&L drops below this
 }
 
 export const DEFAULT_CONFIG: SignalConfig = {
@@ -78,6 +83,11 @@ export const DEFAULT_CONFIG: SignalConfig = {
 
   // 90 second cooldown between trades (less than 2 windows but prevents rapid-fire)
   cooldownMs: 90_000,
+
+  // Compounding & risk
+  compoundFraction: 0.5,       // reinvest 50% of profits
+  maxPositionSize: 200,        // never bet more than $200 per trade
+  pnlFloor: -100,              // auto-pause at -$100
 };
 
 export function generateSignal(
