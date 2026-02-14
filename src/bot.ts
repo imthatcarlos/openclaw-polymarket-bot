@@ -48,6 +48,7 @@ interface BotState {
   totalPnL: number;
   wins: number;
   losses: number;
+  winStreak: number;
   skips: number;
   paused: boolean;
 }
@@ -72,12 +73,13 @@ function loadState(): BotState {
         totalPnL: s.totalPnL ?? 0,
         wins: s.wins ?? 0,
         losses: s.losses ?? 0,
+        winStreak: s.winStreak ?? 0,
         skips: s.skips ?? 0,
         paused: s.paused ?? false,
       };
     } catch {}
   }
-  return { config: { ...DEFAULT_CONFIG }, trades: [], totalPnL: 0, wins: 0, losses: 0, skips: 0, paused: false };
+  return { config: { ...DEFAULT_CONFIG }, trades: [], totalPnL: 0, wins: 0, losses: 0, winStreak: 0, skips: 0, paused: false };
 }
 
 function saveState() {
@@ -88,6 +90,7 @@ function saveState() {
       totalPnL: state.totalPnL,
       wins: state.wins,
       losses: state.losses,
+      winStreak: state.winStreak,
       skips: state.skips,
       paused: state.paused,
     }, null, 2));
@@ -148,10 +151,16 @@ async function settleTrades() {
       trade.result = "win";
       trade.pnl = trade.size * 0.9 - trade.cost;
       state.wins++;
+      state.winStreak++;
+      console.log(`[streak] 🔥 Win streak: ${state.winStreak} | Next bet: $${Math.min(state.config.positionSize * Math.pow(2, state.winStreak), state.config.maxPositionSize ?? 10000).toFixed(0)}`);
     } else {
       trade.result = "loss";
       trade.pnl = -trade.cost;
       state.losses++;
+      if (state.winStreak > 0) {
+        console.log(`[streak] 💀 Streak broken at ${state.winStreak}. Resetting to base $${state.config.positionSize}.`);
+      }
+      state.winStreak = 0;
 
       // Auto post-mortem
       const postMortem = {
@@ -259,17 +268,16 @@ async function onTick(price: number) {
       return;
     }
 
-    // Execute trade — compounding position size
+    // Execute trade — doubling on win streaks
     const tokenPrice = signal.direction === "UP" ? market.upPrice : market.downPrice;
     const bidPrice = Math.min(parseFloat((tokenPrice + 0.02).toFixed(2)), state.config.maxPrice);
 
-    // Compounding: base + percentage of profits, capped at ceiling
+    // Doubling strategy: base * 2^streak, reset on loss, cap at maxPositionSize
     const baseSize = state.config.positionSize;
-    const compoundFraction = state.config.compoundFraction ?? 0.5; // reinvest 50% of profits
-    const maxPositionSize = state.config.maxPositionSize ?? 200; // ceiling
-    const profitBoost = state.totalPnL > 0 ? state.totalPnL * compoundFraction : 0;
-    const tradeSize = Math.min(baseSize + profitBoost, maxPositionSize);
-    console.log(`[compound] base=$${baseSize} + profit_boost=$${profitBoost.toFixed(2)} = $${tradeSize.toFixed(2)} (cap $${maxPositionSize})`);
+    const maxPositionSize = state.config.maxPositionSize ?? 10000;
+    const streak = state.winStreak ?? 0;
+    const tradeSize = Math.min(baseSize * Math.pow(2, streak), maxPositionSize);
+    console.log(`[doubling] base=$${baseSize} × 2^${streak} = $${tradeSize.toFixed(2)} (cap $${maxPositionSize})`);
 
     const size = Math.floor(tradeSize / bidPrice);
     if (size < 1) { checking = false; return; }
@@ -382,10 +390,11 @@ app.get("/status", (_req, res) => {
     },
     config: {
       positionSize: state.config.positionSize,
-      compoundFraction: state.config.compoundFraction ?? 0.5,
-      maxPositionSize: state.config.maxPositionSize ?? 200,
+      maxPositionSize: state.config.maxPositionSize ?? 10000,
       pnlFloor: state.config.pnlFloor ?? -100,
-      effectiveSize: `$${Math.min(state.config.positionSize + Math.max(0, state.totalPnL) * (state.config.compoundFraction ?? 0.5), state.config.maxPositionSize ?? 200).toFixed(2)}`,
+      winStreak: state.winStreak ?? 0,
+      effectiveSize: `$${Math.min(state.config.positionSize * Math.pow(2, state.winStreak ?? 0), state.config.maxPositionSize ?? 10000).toFixed(0)}`,
+      sizingMode: "doubling",
       minDeltaPercent: state.config.minDeltaPercent,
       minDeltaAbsolute: state.config.minDeltaAbsolute,
       minEdgeCents: state.config.minEdgeCents,
@@ -480,7 +489,7 @@ app.post("/stop", (_req, res) => {
 // ── Lifecycle ───────────────────────────────────────────────
 async function start() {
   console.log("═══════════════════════════════════════════════");
-  console.log("  Polymarket BTC 5-Min Bot v3 — Pure Latency Arb");
+  console.log("  Polymarket BTC 5-Min Bot v4 — Doubling Arb");
   console.log(`  Mode: ${state.config.dryRun ? "DRY RUN" : "LIVE"}`);
   console.log(`  Position: $${state.config.positionSize}/trade`);
   console.log(`  Min delta: ${state.config.minDeltaPercent}% / $${state.config.minDeltaAbsolute}`);
