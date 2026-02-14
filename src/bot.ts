@@ -249,10 +249,11 @@ async function onTick(price: number) {
       return;
     }
 
-    // Execute trade
+    // Execute trade — Kelly-sized
     const tokenPrice = signal.direction === "UP" ? market.upPrice : market.downPrice;
     const bidPrice = Math.min(parseFloat((tokenPrice + 0.02).toFixed(2)), state.config.maxPrice);
-    const size = Math.floor(state.config.positionSize / bidPrice);
+    const tradeSize = signal.kellySize ?? state.config.positionSize;
+    const size = Math.floor(tradeSize / bidPrice);
     if (size < 1) { checking = false; return; }
 
     const cost = size * bidPrice;
@@ -436,7 +437,7 @@ app.post("/resume", (_req, res) => {
 });
 
 app.post("/config", (req, res) => {
-  const allowed = Object.keys(DEFAULT_CONFIG);
+  const allowed = [...Object.keys(DEFAULT_CONFIG), "bankroll", "kellyFraction", "minPositionSize"];
   const applied: Record<string, any> = {};
   for (const key of allowed) {
     if (key in req.body) {

@@ -29,6 +29,7 @@ export interface Signal {
   } | null;
   timeInWindow: number;
   timestamp: number;
+  kellySize?: number;
 }
 
 export interface SignalConfig {
@@ -45,7 +46,10 @@ export interface SignalConfig {
   
   // Trade params
   maxPrice: number;            // max bid price
-  positionSize: number;
+  positionSize: number;        // max position size (Kelly caps at this)
+  bankroll: number;            // total bankroll for Kelly sizing
+  kellyFraction: number;       // fractional Kelly (0.5 = half Kelly, safer)
+  minPositionSize: number;     // minimum bet size
   dryRun: boolean;
   
   // Cooldown
@@ -66,7 +70,10 @@ export const DEFAULT_CONFIG: SignalConfig = {
 
   // Trade params
   maxPrice: 0.65,
-  positionSize: 25,
+  positionSize: 50,            // max cap per trade
+  bankroll: 500,               // total bankroll for Kelly calc
+  kellyFraction: 0.25,         // quarter Kelly (conservative)
+  minPositionSize: 5,          // minimum $5 bet
   dryRun: false,
 
   // 90 second cooldown between trades (less than 2 windows but prevents rapid-fire)
@@ -151,7 +158,14 @@ export function generateSignal(
   // ── Signal! ──
   direction = arbDirection;
   confidence = Math.min(0.95, 0.6 + edge);
-  reasons.push(`🎯 LATENCY ARB: ${arbDirection} | BTC ${delta > 0 ? "up" : "down"} $${absDelta.toFixed(0)} but market at ${(tokenPrice * 100).toFixed(0)}%`);
 
-  return { direction, confidence, reasons, priceDelta, marketPrices, timeInWindow, timestamp: Date.now() };
+  // Kelly Criterion: F = (p - P) / (1 - P)
+  // p = our fair value estimate, P = market token price
+  const kellyFull = (fairValue - tokenPrice) / (1 - tokenPrice);
+  const kellyBet = Math.max(config.minPositionSize, Math.min(config.positionSize, config.bankroll * kellyFull * config.kellyFraction));
+  
+  reasons.push(`🎯 LATENCY ARB: ${arbDirection} | BTC ${delta > 0 ? "up" : "down"} $${absDelta.toFixed(0)} but market at ${(tokenPrice * 100).toFixed(0)}%`);
+  reasons.push(`Kelly: F=${(kellyFull * 100).toFixed(1)}% × ${config.kellyFraction} bankroll → $${kellyBet.toFixed(2)}`);
+
+  return { direction, confidence, reasons, priceDelta, marketPrices, timeInWindow, timestamp: Date.now(), kellySize: kellyBet };
 }

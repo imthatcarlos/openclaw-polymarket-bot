@@ -21,7 +21,10 @@ export const DEFAULT_CONFIG = {
     fairValueCap: 0.75, // was 0.80, cap lower
     // Trade params
     maxPrice: 0.65,
-    positionSize: 25,
+    positionSize: 50, // max cap per trade
+    bankroll: 500, // total bankroll for Kelly calc
+    kellyFraction: 0.25, // quarter Kelly (conservative)
+    minPositionSize: 5, // minimum $5 bet
     dryRun: false,
     // 90 second cooldown between trades (less than 2 windows but prevents rapid-fire)
     cooldownMs: 90_000,
@@ -84,6 +87,11 @@ config = DEFAULT_CONFIG) {
     // ── Signal! ──
     direction = arbDirection;
     confidence = Math.min(0.95, 0.6 + edge);
+    // Kelly Criterion: F = (p - P) / (1 - P)
+    // p = our fair value estimate, P = market token price
+    const kellyFull = (fairValue - tokenPrice) / (1 - tokenPrice);
+    const kellyBet = Math.max(config.minPositionSize, Math.min(config.positionSize, config.bankroll * kellyFull * config.kellyFraction));
     reasons.push(`🎯 LATENCY ARB: ${arbDirection} | BTC ${delta > 0 ? "up" : "down"} $${absDelta.toFixed(0)} but market at ${(tokenPrice * 100).toFixed(0)}%`);
-    return { direction, confidence, reasons, priceDelta, marketPrices, timeInWindow, timestamp: Date.now() };
+    reasons.push(`Kelly: F=${(kellyFull * 100).toFixed(1)}% × ${config.kellyFraction} bankroll → $${kellyBet.toFixed(2)}`);
+    return { direction, confidence, reasons, priceDelta, marketPrices, timeInWindow, timestamp: Date.now(), kellySize: kellyBet };
 }
