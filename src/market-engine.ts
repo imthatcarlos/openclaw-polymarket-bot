@@ -35,8 +35,8 @@ export async function findCurrentMarket(): Promise<MarketInfo | null> {
   const currentWindowStart = Math.floor(now / 300) * 300;
   const timeIntoWindow = now - currentWindowStart;
 
-  // Only trade current window, skip if >3 min in
-  if (timeIntoWindow > 180) return null;
+  // Only trade current window, skip if >4 min in (arb can trade later)
+  if (timeIntoWindow > 240) return null;
 
   const slug = `btc-updown-5m-${currentWindowStart}`;
 

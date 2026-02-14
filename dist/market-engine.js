@@ -17,8 +17,8 @@ export async function findCurrentMarket() {
     const now = Math.floor(Date.now() / 1000);
     const currentWindowStart = Math.floor(now / 300) * 300;
     const timeIntoWindow = now - currentWindowStart;
-    // Only trade current window, skip if >3 min in
-    if (timeIntoWindow > 180)
+    // Only trade current window, skip if >4 min in (arb can trade later)
+    if (timeIntoWindow > 240)
         return null;
     const slug = `btc-updown-5m-${currentWindowStart}`;
     try {
