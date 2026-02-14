@@ -157,8 +157,10 @@ export function generateSignal(
     // ── Deceleration veto ──
     // If momentum is decelerating against the trade direction, skip.
     // For UP: accel should be positive (speeding up). For DOWN: accel should be negative.
-    const upDecelVeto = momAccel < -0.02;   // momentum decelerating — bad for UP
-    const downDecelVeto = momAccel > 0.02;  // momentum decelerating — bad for DOWN
+    // POST-MORTEM (trade #18): mom5=-0.032% but accel was positive (getting less bad).
+    // Bot bet UP into negative 5-min momentum. Fix: also check mom5 direction.
+    const upDecelVeto = momAccel < -0.02 || mom5 < -0.01;   // decel OR negative 5-min momentum
+    const downDecelVeto = momAccel > 0.02 || mom5 > 0.01;   // decel OR positive 5-min momentum
 
     // Tightened rules: NO trend-follow at extremes (that was losing)
     // Only mean-reversion with trend confirmation + exhaustion/decel guards
