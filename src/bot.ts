@@ -191,6 +191,15 @@ async function settleTrades() {
     state.totalPnL += trade.pnl;
     console.log(`[settle] ${trade.market} | ${trade.direction} | ${trade.result.toUpperCase()} | P&L: $${trade.pnl.toFixed(2)} | Total: $${state.totalPnL.toFixed(2)}`);
     saveState();
+
+    // Post-settlement circuit breaker
+    const floor = state.config.pnlFloor ?? -100;
+    if (state.totalPnL <= floor) {
+      console.log(`[circuit-breaker] 🛑 P&L $${state.totalPnL.toFixed(2)} hit floor $${floor} after settlement. Auto-pausing.`);
+      state.paused = true;
+      saveState();
+      return; // stop settling further trades
+    }
   }
 }
 
