@@ -42,9 +42,14 @@ config = DEFAULT_CONFIG) {
         impliedProb: 0,
     };
     reasons.push(`BTC: $${currentPrice.toFixed(0)} | Δ: ${delta > 0 ? "+" : ""}$${delta.toFixed(0)} (${deltaPct > 0 ? "+" : ""}${deltaPct.toFixed(3)}%) | ${timeInWindow}s into window`);
-    // ── Check minimum move ──
-    if (absDeltaPct < config.minDeltaPercent || absDelta < config.minDeltaAbsolute) {
-        reasons.push(`Move too small (need >${config.minDeltaPercent}% / $${config.minDeltaAbsolute})`);
+    // ── Check minimum move (time-scaled) ──
+    // Earlier in window = needs bigger move (more time for reversal)
+    // At 30s: 2x threshold, at 150s: ~1.3x, at 240s: 1x
+    const timeScale = 1 + (1 - timeInWindow / 240); // 2.0 at 0s, 1.0 at 240s
+    const scaledMinPct = config.minDeltaPercent * timeScale;
+    const scaledMinAbs = config.minDeltaAbsolute * timeScale;
+    if (absDeltaPct < scaledMinPct || absDelta < scaledMinAbs) {
+        reasons.push(`Move too small for ${timeInWindow}s in (need >${scaledMinPct.toFixed(3)}% / $${scaledMinAbs.toFixed(0)}, got ${absDeltaPct.toFixed(3)}% / $${absDelta.toFixed(0)})`);
         return { direction: null, confidence: 0, reasons, priceDelta, marketPrices, timeInWindow, timestamp: Date.now() };
     }
     // ── Time weighting ──
