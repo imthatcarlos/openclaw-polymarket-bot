@@ -233,6 +233,7 @@ async function onTick(price) {
             timeInWindow,
             tokenPriceAtEntry: tokenPrice,
             fairValueAtEntry: fairValue,
+            hourUTC: new Date().getUTCHours(),
         };
         if (!state.config.dryRun && clobClient) {
             try {
@@ -330,6 +331,32 @@ app.get("/status", (_req, res) => {
 });
 app.get("/trades", (_req, res) => {
     res.json(state.trades.slice(-50).reverse());
+});
+app.get("/stats/hourly", (_req, res) => {
+    const hourly = {};
+    for (let h = 0; h < 24; h++)
+        hourly[h] = { trades: 0, wins: 0, losses: 0, pnl: 0 };
+    for (const t of state.trades) {
+        if (t.result === "dry-run" || t.result === "pending")
+            continue;
+        const h = t.hourUTC ?? new Date(t.timestamp).getUTCHours();
+        hourly[h].trades++;
+        if (t.result === "win")
+            hourly[h].wins++;
+        if (t.result === "loss")
+            hourly[h].losses++;
+        hourly[h].pnl += t.pnl;
+    }
+    // Only show hours with trades
+    const active = Object.entries(hourly)
+        .filter(([_, v]) => v.trades > 0)
+        .map(([h, v]) => ({
+        hour: `${h.toString().padStart(2, "0")}:00 UTC`,
+        ...v,
+        winRate: v.wins + v.losses > 0 ? `${((v.wins / (v.wins + v.losses)) * 100).toFixed(0)}%` : "N/A",
+        pnl: `$${v.pnl.toFixed(2)}`,
+    }));
+    res.json({ hourly: active });
 });
 app.get("/post-mortems", (_req, res) => {
     try {
