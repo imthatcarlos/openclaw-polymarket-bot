@@ -216,6 +216,17 @@ async function onTick(price: number) {
   if (state.paused || checking) return;
   tickCount++;
 
+  // Always try to settle pending trades, regardless of price movement
+  const hasPending = state.trades.some(t => t.result === "pending");
+  if (hasPending) {
+    checking = true;
+    try { await settleTrades(); } catch (e) { /* ignore */ }
+    checking = false;
+    saveState();
+    // If still pending after settle attempt, skip signal generation
+    if (state.trades.some(t => t.result === "pending")) return;
+  }
+
   const now = Math.floor(Date.now() / 1000);
   const currentWindowStart = Math.floor(now / 300) * 300;
   const timeInWindow = now - currentWindowStart;
@@ -238,10 +249,6 @@ async function onTick(price: number) {
 
   // Already traded this window
   if (tradedWindows.has(currentWindowStart)) return;
-
-  // Don't place a new trade while any trade is pending settlement
-  const hasPending = state.trades.some(t => t.result === "pending");
-  if (hasPending) return;
 
   // Cooldown after trade completes (win or loss)
   if (Date.now() - lastTradeTime < state.config.cooldownMs) return;
