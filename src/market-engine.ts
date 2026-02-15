@@ -14,6 +14,8 @@ export interface MarketInfo {
   downTokenId: string;
   upPrice: number;
   downPrice: number;
+  upAsk: number;   // actual cheapest sell offer from orderbook
+  downAsk: number; // actual cheapest sell offer from orderbook
   acceptingOrders: boolean;
 }
 
@@ -57,6 +59,38 @@ export async function findCurrentMarket(): Promise<MarketInfo | null> {
     const upIdx = outcomes.findIndex((o: string) => /up/i.test(o));
     const downIdx = outcomes.findIndex((o: string) => /down/i.test(o));
 
+    const upTokenId = clobTokenIds[upIdx >= 0 ? upIdx : 0];
+    const downTokenId = clobTokenIds[downIdx >= 0 ? downIdx : 1];
+    const upMid = parseFloat(outcomePrices[upIdx >= 0 ? upIdx : 0]);
+    const downMid = parseFloat(outcomePrices[downIdx >= 0 ? downIdx : 1]);
+
+    // Fetch real orderbook asks (cheapest sell offers)
+    let upAsk = upMid;
+    let downAsk = downMid;
+    try {
+      const bookRes = await proxiedFetch(`https://clob.polymarket.com/book?token_id=${upTokenId}`);
+      if (bookRes.ok) {
+        const book = await bookRes.json() as any;
+        if (book?.asks?.length > 0) {
+          // asks are sorted lowest first
+          upAsk = parseFloat(book.asks[0].price);
+        }
+        if (book?.bids?.length > 0) {
+          // For the opposite side (down), the best bid on UP = effective down ask
+          // Actually we need the down book separately
+        }
+      }
+      const downBookRes = await proxiedFetch(`https://clob.polymarket.com/book?token_id=${downTokenId}`);
+      if (downBookRes.ok) {
+        const downBook = await downBookRes.json() as any;
+        if (downBook?.asks?.length > 0) {
+          downAsk = parseFloat(downBook.asks[0].price);
+        }
+      }
+    } catch (e) {
+      // Fall back to mid prices if orderbook fetch fails
+    }
+
     return {
       slug,
       question: market.question,
@@ -64,10 +98,12 @@ export async function findCurrentMarket(): Promise<MarketInfo | null> {
       endDate: market.endDate,
       windowStart: currentWindowStart,
       windowEnd: currentWindowStart + 300,
-      upTokenId: clobTokenIds[upIdx >= 0 ? upIdx : 0],
-      downTokenId: clobTokenIds[downIdx >= 0 ? downIdx : 1],
-      upPrice: parseFloat(outcomePrices[upIdx >= 0 ? upIdx : 0]),
-      downPrice: parseFloat(outcomePrices[downIdx >= 0 ? downIdx : 1]),
+      upTokenId,
+      downTokenId,
+      upPrice: upMid,
+      downPrice: downMid,
+      upAsk,
+      downAsk,
       acceptingOrders: market.acceptingOrders ?? true,
     };
   } catch (e) {

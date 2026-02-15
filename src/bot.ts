@@ -93,6 +93,13 @@ async function getWalletBalance(): Promise<number> {
   }
 }
 
+async function getDynamicGas(): Promise<{ gasPrice: any }> {
+  const provider = signer!.provider! as any;
+  const gasPrice = await provider.getGasPrice();
+  const bumped = gasPrice.mul(130).div(100); // 30% above current
+  return { gasPrice: bumped };
+}
+
 async function redeemPosition(conditionId: string): Promise<boolean> {
   if (!signer) return false;
   try {
@@ -106,9 +113,8 @@ async function redeemPosition(conditionId: string): Promise<boolean> {
       conditionId,
       [1, 2],
       {
-        maxPriorityFeePerGas: ethers.utils.parseUnits("50", "gwei"),
-        maxFeePerGas: ethers.utils.parseUnits("500", "gwei"),
-        gasLimit: 200000,
+        ...(await getDynamicGas()),
+        gasLimit: 300000,
       }
     );
     console.log(`[redeem] TX: ${tx.hash}`);
@@ -383,10 +389,23 @@ async function onTick(price: number) {
       return;
     }
 
-    // Execute trade — doubling on win streaks
+    // Execute trade — use actual orderbook ask price to ensure fill
     const tokenPrice = signal.direction === "UP" ? market.upPrice : market.downPrice;
-    // Bid aggressively to ensure fill: token price + 5¢, or at least $0.55
-    const bidPrice = Math.min(parseFloat(Math.max(tokenPrice + 0.05, 0.55).toFixed(2)), state.config.maxPrice);
+    const askPrice = signal.direction === "UP" ? market.upAsk : market.downAsk;
+    // Bid at the ask price (what it actually costs to buy) + 1¢ buffer
+    const bidPrice = Math.min(parseFloat((askPrice + 0.01).toFixed(2)), state.config.maxPrice);
+    console.log(`[bid] mid=$${tokenPrice.toFixed(2)} ask=$${askPrice.toFixed(2)} → bidding $${bidPrice}`);
+
+    // Edge check: only trade if fair value > ask price (positive expected value at real cost)
+    const quickFairValue = signal.priceDelta ?
+      Math.min(0.50 + Math.abs(signal.priceDelta.percent) * 2.5 * (0.5 + timeInWindow / 600), 0.95) : 0.50;
+    const realEdge = quickFairValue - askPrice;
+    if (realEdge < 0.05) {
+      console.log(`[bid] ❌ No edge at ask price: fair=$${quickFairValue.toFixed(2)} ask=$${askPrice.toFixed(2)} edge=${(realEdge*100).toFixed(1)}¢ — skipping`);
+      state.skips++;
+      checking = false;
+      return;
+    }
 
     // Kelly-adjacent sizing: bet a fraction of bankroll based on edge
     // Kelly f* = (p*b - q) / b where p=win%, b=payout ratio, q=loss%
