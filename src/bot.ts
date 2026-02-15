@@ -239,7 +239,11 @@ async function onTick(price: number) {
   // Already traded this window
   if (tradedWindows.has(currentWindowStart)) return;
 
-  // Cooldown
+  // Don't place a new trade while any trade is pending settlement
+  const hasPending = state.trades.some(t => t.result === "pending");
+  if (hasPending) return;
+
+  // Cooldown after trade completes (win or loss)
   if (Date.now() - lastTradeTime < state.config.cooldownMs) return;
 
   // Don't trade first 30s (window open price might be stale) or last 60s (resolution too close)
