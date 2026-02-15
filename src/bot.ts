@@ -389,23 +389,17 @@ async function onTick(price: number) {
       return;
     }
 
-    // Execute trade — use actual orderbook ask price to ensure fill
+    // Execute trade — bid at token mid price + spread to cross
+    // Polymarket binary CLOB: UP book has only bids, no asks. To buy UP you place a BUY
+    // order and it matches against the other side. Effective cost ≈ mid price.
+    // The complementary token's best bid = 1 - effective ask for our token.
     const tokenPrice = signal.direction === "UP" ? market.upPrice : market.downPrice;
-    const askPrice = signal.direction === "UP" ? market.upAsk : market.downAsk;
-    // Bid at the ask price (what it actually costs to buy) + 1¢ buffer
-    const bidPrice = Math.min(parseFloat((askPrice + 0.01).toFixed(2)), state.config.maxPrice);
-    console.log(`[bid] mid=$${tokenPrice.toFixed(2)} ask=$${askPrice.toFixed(2)} → bidding $${bidPrice}`);
-
-    // Edge check: only trade if fair value > ask price (positive expected value at real cost)
-    const quickFairValue = signal.priceDelta ?
-      Math.min(0.50 + Math.abs(signal.priceDelta.percent) * 2.5 * (0.5 + timeInWindow / 600), 0.95) : 0.50;
-    const realEdge = quickFairValue - askPrice;
-    if (realEdge < 0.05) {
-      console.log(`[bid] ❌ No edge at ask price: fair=$${quickFairValue.toFixed(2)} ask=$${askPrice.toFixed(2)} edge=${(realEdge*100).toFixed(1)}¢ — skipping`);
-      state.skips++;
-      checking = false;
-      return;
-    }
+    const complementaryBid = signal.direction === "UP" ? market.downBestBid : market.upBestBid;
+    // Effective ask = 1 - complementary best bid (what it actually costs to buy our token)
+    const effectiveAsk = complementaryBid > 0 ? parseFloat((1 - complementaryBid).toFixed(2)) : tokenPrice;
+    // Bid slightly above effective ask to ensure fill
+    const bidPrice = Math.min(parseFloat(Math.max(effectiveAsk + 0.02, tokenPrice + 0.02).toFixed(2)), state.config.maxPrice);
+    console.log(`[bid] mid=$${tokenPrice.toFixed(2)} compBid=$${complementaryBid.toFixed(2)} effAsk=$${effectiveAsk.toFixed(2)} → bidding $${bidPrice}`);
 
     // Kelly-adjacent sizing: bet a fraction of bankroll based on edge
     // Kelly f* = (p*b - q) / b where p=win%, b=payout ratio, q=loss%
