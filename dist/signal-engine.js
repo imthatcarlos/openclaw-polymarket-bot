@@ -1,14 +1,14 @@
 /**
- * Signal Engine v7 — Pure Latency Arbitrage
+ * Signal Engine v8 — Black-Scholes Latency Arbitrage
  *
  * Strategy: Exploit price delta between Binance spot and Polymarket odds.
- * When BTC moves significantly from window open price but Polymarket odds
- * haven't caught up, there's an edge.
+ * Fair value now calculated via Black-Scholes binary option model instead
+ * of linear approximation. Gives proper volatility-adjusted probabilities
+ * and time decay modeling.
  *
- * Dropped: All technical indicators (StochRSI, momentum, mean-reversion).
- * Technical signals were ~50% win rate on 5-min windows = no edge.
- * Latency arb has been consistently winning.
+ * Inspired by: @lunatik_corp's $1.5K→$33K playbook using BS for binary options.
  */
+import { binaryOptionFairValue } from "./black-scholes.js";
 export const DEFAULT_CONFIG = {
     // Arb: trigger when BTC moves >0.06% ($40+) from window open
     minDeltaPercent: 0.06,
@@ -28,6 +28,10 @@ export const DEFAULT_CONFIG = {
     dryRun: false,
     // 90 second cooldown between trades (less than 2 windows but prevents rapid-fire)
     cooldownMs: 90_000,
+    // Compounding & risk
+    compoundFraction: 0.5, // reinvest 50% of profits
+    maxPositionSize: 200, // never bet more than $200 per trade
+    pnlFloor: -100, // auto-pause at -$100
 };
 export function generateSignal(windowOpenPrice, currentPrice, marketUpPrice, marketDownPrice, timeInWindow, // seconds into 5-min window (0-300)
 config = DEFAULT_CONFIG) {
@@ -55,20 +59,24 @@ config = DEFAULT_CONFIG) {
         reasons.push(`Move too small for ${timeInWindow}s in (need >${scaledMinPct.toFixed(3)}% / $${scaledMinAbs.toFixed(0)}, got ${absDeltaPct.toFixed(3)}% / $${absDelta.toFixed(0)})`);
         return { direction: null, confidence: 0, reasons, priceDelta, marketPrices, timeInWindow, timestamp: Date.now() };
     }
-    // ── Time weighting ──
-    // Later in window = move more likely to hold = higher fair value
-    // At 30s: weight 0.6, at 150s: weight 0.8, at 240s: weight 0.98
-    const timeWeight = 0.5 + (timeInWindow / 300) * 0.5;
-    // ── Fair value estimate ──
-    const rawFair = config.fairValueBase + (absDeltaPct * config.fairValueMultiplier * timeWeight);
-    const fairValue = Math.min(rawFair, config.fairValueCap);
+    // ── Time remaining ──
+    const timeRemainingSeconds = Math.max(300 - timeInWindow, 1);
+    const timeWeight = 0.5 + (timeInWindow / 300) * 0.5; // for logging
+    // ── Black-Scholes Fair Value ──
+    // Use annualized vol estimate. BTC ~50% annual vol baseline,
+    // but short-term realized vol can be much higher.
+    // TODO: feed real price history for dynamic vol estimation
+    const annualizedVol = 0.50; // conservative BTC annual vol
+    const bs = binaryOptionFairValue(currentPrice, windowOpenPrice, timeRemainingSeconds, annualizedVol);
+    // fairValue = probability that price ends in our direction
+    const fairValue = delta > 0 ? bs.fairUp : bs.fairDown;
     // ── Direction & edge ──
     const arbDirection = delta > 0 ? "UP" : "DOWN";
     const tokenPrice = arbDirection === "UP" ? marketUpPrice : marketDownPrice;
     marketPrices.impliedProb = tokenPrice; // token price ≈ implied probability
     const edge = fairValue - tokenPrice;
     reasons.push(`Market: UP=$${marketUpPrice.toFixed(2)} DOWN=$${marketDownPrice.toFixed(2)}`);
-    reasons.push(`Fair: $${fairValue.toFixed(3)} (tw=${timeWeight.toFixed(2)}) | Token: $${tokenPrice.toFixed(2)} | Edge: ${(edge * 100).toFixed(1)}¢`);
+    reasons.push(`BS Fair: $${fairValue.toFixed(3)} (d2=${bs.d2.toFixed(2)}, σ=${annualizedVol}, ${timeRemainingSeconds}s left) | Token: $${tokenPrice.toFixed(2)} | Edge: ${(edge * 100).toFixed(1)}¢`);
     // ── Filters ──
     if (tokenPrice >= config.maxTokenPrice) {
         reasons.push(`SKIP: Market already priced in (${tokenPrice.toFixed(2)} >= ${config.maxTokenPrice})`);
