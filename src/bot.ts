@@ -151,16 +151,22 @@ async function settleTrades() {
       trade.result = "win";
       trade.pnl = trade.size * 0.9 - trade.cost;
       state.wins++;
-      state.winStreak++;
-      console.log(`[streak] 🔥 Win streak: ${state.winStreak} | Next bet: $${Math.min(state.config.positionSize * Math.pow(2, state.winStreak), state.config.maxPositionSize ?? 10000).toFixed(0)}`);
+      state.winStreak = (state.winStreak ?? 0) + 1;
+      const br = Math.max((state.config.bankroll ?? 500) + state.totalPnL + trade.pnl, state.config.positionSize);
+      const wr = state.wins / Math.max(state.wins + state.losses, 1);
+      const ko = Math.max((wr * 0.7 - (1 - wr)) / 0.7, 0);
+      const nextSize = Math.min(Math.max(br * ko * (state.config.kellyFraction ?? 0.25), state.config.positionSize), state.config.maxPositionSize ?? 10000);
+      console.log(`[kelly] ✅ Win | bankroll=$${br.toFixed(0)} | WR=${(wr*100).toFixed(1)}% | next=$${nextSize.toFixed(0)}`);
     } else {
       trade.result = "loss";
       trade.pnl = -trade.cost;
       state.losses++;
-      if (state.winStreak > 0) {
-        console.log(`[streak] 💀 Streak broken at ${state.winStreak}. Resetting to base $${state.config.positionSize}.`);
-      }
       state.winStreak = 0;
+      const br = Math.max((state.config.bankroll ?? 500) + state.totalPnL + trade.pnl, state.config.positionSize);
+      const wr = state.wins / Math.max(state.wins + state.losses, 1);
+      const ko = Math.max((wr * 0.7 - (1 - wr)) / 0.7, 0);
+      const nextSize = Math.min(Math.max(br * ko * (state.config.kellyFraction ?? 0.25), state.config.positionSize), state.config.maxPositionSize ?? 10000);
+      console.log(`[kelly] ❌ Loss | bankroll=$${br.toFixed(0)} | WR=${(wr*100).toFixed(1)}% | next=$${nextSize.toFixed(0)}`);
 
       // Auto post-mortem
       const postMortem = {
@@ -281,12 +287,24 @@ async function onTick(price: number) {
     const tokenPrice = signal.direction === "UP" ? market.upPrice : market.downPrice;
     const bidPrice = Math.min(parseFloat((tokenPrice + 0.02).toFixed(2)), state.config.maxPrice);
 
-    // Doubling strategy: base * 2^streak, reset on loss, cap at maxPositionSize
+    // Kelly-adjacent sizing: bet a fraction of bankroll based on edge
+    // Kelly f* = (p*b - q) / b where p=win%, b=payout ratio, q=loss%
+    // With 72% WR and ~0.7 payout: full Kelly ~32%. We use quarter Kelly for safety.
     const baseSize = state.config.positionSize;
     const maxPositionSize = state.config.maxPositionSize ?? 10000;
-    const streak = state.winStreak ?? 0;
-    const tradeSize = Math.min(baseSize * Math.pow(2, streak), maxPositionSize);
-    console.log(`[doubling] base=$${baseSize} × 2^${streak} = $${tradeSize.toFixed(2)} (cap $${maxPositionSize})`);
+    const kellyFraction = state.config.kellyFraction ?? 0.25; // quarter Kelly
+    const bankroll = state.config.bankroll ?? 500;
+    
+    // Effective bankroll = initial bankroll + cumulative P&L (never below baseSize)
+    const effectiveBankroll = Math.max(bankroll + state.totalPnL, baseSize);
+    const winRate = state.wins / Math.max(state.wins + state.losses, 1);
+    const payoutRatio = 0.7; // avg ~70% return on winning trades at ~51¢ entry
+    const kellyOptimal = Math.max((winRate * payoutRatio - (1 - winRate)) / payoutRatio, 0);
+    const tradeSize = Math.min(
+      Math.max(effectiveBankroll * kellyOptimal * kellyFraction, baseSize),
+      maxPositionSize
+    );
+    console.log(`[kelly] bankroll=$${effectiveBankroll.toFixed(0)} × kelly=${(kellyOptimal*100).toFixed(1)}% × ${kellyFraction} = $${tradeSize.toFixed(2)} (floor $${baseSize}, cap $${maxPositionSize})`);
 
     const size = Math.floor(tradeSize / bidPrice);
     if (size < 1) { checking = false; return; }
@@ -402,8 +420,14 @@ app.get("/status", (_req, res) => {
       maxPositionSize: state.config.maxPositionSize ?? 10000,
       pnlFloor: state.config.pnlFloor ?? -100,
       winStreak: state.winStreak ?? 0,
-      effectiveSize: `$${Math.min(state.config.positionSize * Math.pow(2, state.winStreak ?? 0), state.config.maxPositionSize ?? 10000).toFixed(0)}`,
-      sizingMode: "doubling",
+      effectiveSize: (() => {
+        const br = Math.max((state.config.bankroll ?? 500) + state.totalPnL, state.config.positionSize);
+        const wr = state.wins / Math.max(state.wins + state.losses, 1);
+        const ko = Math.max((wr * 0.7 - (1 - wr)) / 0.7, 0);
+        const kf = state.config.kellyFraction ?? 0.25;
+        return `$${Math.min(Math.max(br * ko * kf, state.config.positionSize), state.config.maxPositionSize ?? 10000).toFixed(0)}`;
+      })(),
+      sizingMode: "kelly",
       minDeltaPercent: state.config.minDeltaPercent,
       minDeltaAbsolute: state.config.minDeltaAbsolute,
       minEdgeCents: state.config.minEdgeCents,
@@ -498,7 +522,7 @@ app.post("/stop", (_req, res) => {
 // ── Lifecycle ───────────────────────────────────────────────
 async function start() {
   console.log("═══════════════════════════════════════════════");
-  console.log("  Polymarket BTC 5-Min Bot v4 — Doubling Arb");
+  console.log("  Polymarket BTC 5-Min Bot v5 — Kelly Arb");
   console.log(`  Mode: ${state.config.dryRun ? "DRY RUN" : "LIVE"}`);
   console.log(`  Position: $${state.config.positionSize}/trade`);
   console.log(`  Min delta: ${state.config.minDeltaPercent}% / $${state.config.minDeltaAbsolute}`);
