@@ -385,7 +385,8 @@ async function onTick(price: number) {
 
     // Execute trade — doubling on win streaks
     const tokenPrice = signal.direction === "UP" ? market.upPrice : market.downPrice;
-    const bidPrice = Math.min(parseFloat((tokenPrice + 0.02).toFixed(2)), state.config.maxPrice);
+    // Bid aggressively to ensure fill: token price + 5¢, or at least $0.55
+    const bidPrice = Math.min(parseFloat(Math.max(tokenPrice + 0.05, 0.55).toFixed(2)), state.config.maxPrice);
 
     // Kelly-adjacent sizing: bet a fraction of bankroll based on edge
     // Kelly f* = (p*b - q) / b where p=win%, b=payout ratio, q=loss%
