@@ -1,6 +1,7 @@
 /**
- * Polymarket BTC 5-Min Trading Bot v3
+ * Polymarket BTC 5-Min Trading Bot v6
  * Pure latency arbitrage — event-driven on WebSocket price ticks
+ * P&L tracked via wallet balance, not calculated
  */
 
 import express from "express";
@@ -17,6 +18,9 @@ const RPC_URL = process.env.RPC_URL || "https://polygon-rpc.com";
 const STATE_FILE = new URL("../state.json", import.meta.url).pathname;
 const PM_FILE = new URL("../post-mortems.jsonl", import.meta.url).pathname;
 const BOT_PORT = parseInt(process.env.BOT_PORT || "3847");
+const USDC_ADDRESS = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174";
+const CTF_ADDRESS = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045";
+const WALLET_ADDRESS = process.env.WALLET_ADDRESS || "0x1a1E1b82Da7E91E9567a40b0f952748b586389F9";
 
 // ── Types ───────────────────────────────────────────────────
 interface Trade {
@@ -32,6 +36,9 @@ interface Trade {
   result: "win" | "loss" | "pending" | "dry-run";
   pnl: number;
   orderId?: string;
+  conditionId?: string;
+  walletBefore?: number;  // USDC balance before order
+  walletAfter?: number;   // USDC balance after settlement
   // Arb context
   btcAtEntry: number;
   btcWindowOpen: number;
@@ -51,6 +58,7 @@ interface BotState {
   winStreak: number;
   skips: number;
   paused: boolean;
+  sessionStartBalance?: number;  // Wallet balance when bot started
 }
 
 // ── Loss Pattern Categorization ─────────────────────────────
@@ -60,6 +68,57 @@ function categorizeLoss(trade: Trade): string {
   if (Math.abs(trade.deltaAtEntry) < 50) return "ARB_SMALL_MOVE";
   if (trade.tokenPriceAtEntry > 0.52) return "ARB_MARKET_KNEW";
   return "ARB_REVERSAL";
+}
+
+// ── Wallet Helpers ──────────────────────────────────────────
+let provider: ethers.providers.Provider | null = null;
+let signer: ethers.Wallet | null = null;
+
+function getProvider(): ethers.providers.Provider {
+  if (!provider) {
+    provider = new ethers.providers.StaticJsonRpcProvider(RPC_URL, { name: "polygon", chainId: 137 });
+  }
+  return provider;
+}
+
+async function getWalletBalance(): Promise<number> {
+  try {
+    const p = getProvider();
+    const usdc = new ethers.Contract(USDC_ADDRESS, ["function balanceOf(address) view returns (uint256)"], p);
+    const bal = await usdc.balanceOf(WALLET_ADDRESS);
+    return parseFloat(ethers.utils.formatUnits(bal, 6));
+  } catch (e: any) {
+    console.error("[wallet] Balance check failed:", e.message);
+    return -1;
+  }
+}
+
+async function redeemPosition(conditionId: string): Promise<boolean> {
+  if (!signer) return false;
+  try {
+    const ctf = new ethers.Contract(CTF_ADDRESS, [
+      "function redeemPositions(address collateralToken, bytes32 parentCollectionId, bytes32 conditionId, uint256[] indexSets) external"
+    ], signer);
+
+    const tx = await ctf.redeemPositions(
+      USDC_ADDRESS,
+      ethers.constants.HashZero,
+      conditionId,
+      [1, 2],
+      {
+        maxPriorityFeePerGas: ethers.utils.parseUnits("50", "gwei"),
+        maxFeePerGas: ethers.utils.parseUnits("500", "gwei"),
+        gasLimit: 200000,
+      }
+    );
+    console.log(`[redeem] TX: ${tx.hash}`);
+    const receipt = await tx.wait();
+    console.log(`[redeem] ${receipt.status === 1 ? "SUCCESS" : "FAILED"}`);
+    return receipt.status === 1;
+  } catch (e: any) {
+    console.error(`[redeem] Failed: ${e.message}`);
+    return false;
+  }
 }
 
 // ── State ───────────────────────────────────────────────────
@@ -120,8 +179,8 @@ async function initClobClient() {
     return null;
   }
   try {
-    const provider = new ethers.providers.StaticJsonRpcProvider(RPC_URL, { name: "polygon", chainId: 137 });
-    const signer = new ethers.Wallet(process.env.EVM_PRIVATE_KEY, provider);
+    const p = getProvider();
+    signer = new ethers.Wallet(process.env.EVM_PRIVATE_KEY, p);
     console.log(`[bot] Wallet: ${signer.address}`);
     const client = new ClobClient(PROXY_URL, 137, signer);
     const creds = await client.createOrDeriveApiKey();
@@ -149,24 +208,43 @@ async function settleTrades() {
 
     if (won) {
       trade.result = "win";
-      trade.pnl = trade.size * 0.9 - trade.cost;
       state.wins++;
       state.winStreak = (state.winStreak ?? 0) + 1;
-      const br = Math.max((state.config.bankroll ?? 500) + state.totalPnL + trade.pnl, state.config.positionSize);
-      const wr = state.wins / Math.max(state.wins + state.losses, 1);
-      const ko = Math.max((wr * 0.7 - (1 - wr)) / 0.7, 0);
-      const nextSize = Math.min(Math.max(br * ko * (state.config.kellyFraction ?? 0.25), state.config.positionSize), state.config.maxPositionSize ?? 10000);
-      console.log(`[kelly] ✅ Win | bankroll=$${br.toFixed(0)} | WR=${(wr*100).toFixed(1)}% | next=$${nextSize.toFixed(0)}`);
+
+      // Auto-redeem winning position to get USDC back
+      if (trade.conditionId) {
+        console.log(`[settle] Redeeming winning position...`);
+        await redeemPosition(trade.conditionId);
+      }
+
+      // Measure P&L from wallet balance
+      const balAfter = await getWalletBalance();
+      trade.walletAfter = balAfter;
+      if (trade.walletBefore != null && trade.walletBefore >= 0 && balAfter >= 0) {
+        trade.pnl = balAfter - trade.walletBefore;
+      } else {
+        // Fallback to calculated P&L if balance check failed
+        trade.pnl = trade.size * 0.9 - trade.cost;
+        console.log(`[settle] ⚠️ Using calculated P&L (balance unavailable): $${trade.pnl.toFixed(2)}`);
+      }
+
+      console.log(`[kelly] ✅ Win | wallet=$${(trade.walletAfter ?? 0).toFixed(2)} | WR=${((state.wins / Math.max(state.wins + state.losses, 1))*100).toFixed(1)}%`);
     } else {
       trade.result = "loss";
-      trade.pnl = -trade.cost;
       state.losses++;
       state.winStreak = 0;
-      const br = Math.max((state.config.bankroll ?? 500) + state.totalPnL + trade.pnl, state.config.positionSize);
-      const wr = state.wins / Math.max(state.wins + state.losses, 1);
-      const ko = Math.max((wr * 0.7 - (1 - wr)) / 0.7, 0);
-      const nextSize = Math.min(Math.max(br * ko * (state.config.kellyFraction ?? 0.25), state.config.positionSize), state.config.maxPositionSize ?? 10000);
-      console.log(`[kelly] ❌ Loss | bankroll=$${br.toFixed(0)} | WR=${(wr*100).toFixed(1)}% | next=$${nextSize.toFixed(0)}`);
+
+      // On loss, tokens are worthless. P&L = what we spent
+      const balAfter = await getWalletBalance();
+      trade.walletAfter = balAfter;
+      if (trade.walletBefore != null && trade.walletBefore >= 0 && balAfter >= 0) {
+        trade.pnl = balAfter - trade.walletBefore;
+      } else {
+        trade.pnl = -trade.cost;
+        console.log(`[settle] ⚠️ Using calculated P&L (balance unavailable): $${trade.pnl.toFixed(2)}`);
+      }
+
+      console.log(`[kelly] ❌ Loss | wallet=$${(trade.walletAfter ?? 0).toFixed(2)} | WR=${((state.wins / Math.max(state.wins + state.losses, 1))*100).toFixed(1)}%`);
 
       // Auto post-mortem
       const postMortem = {
@@ -195,16 +273,27 @@ async function settleTrades() {
     }
 
     state.totalPnL += trade.pnl;
-    console.log(`[settle] ${trade.market} | ${trade.direction} | ${trade.result.toUpperCase()} | P&L: $${trade.pnl.toFixed(2)} | Total: $${state.totalPnL.toFixed(2)}`);
+
+    // Update session P&L from wallet balance
+    const currentBal = trade.walletAfter ?? await getWalletBalance();
+    if (state.sessionStartBalance != null && currentBal >= 0) {
+      const sessionPnL = currentBal - state.sessionStartBalance;
+      console.log(`[settle] ${trade.market} | ${trade.direction} | ${trade.result.toUpperCase()} | Trade P&L: $${trade.pnl.toFixed(2)} | Session P&L: $${sessionPnL.toFixed(2)} (wallet: $${currentBal.toFixed(2)})`);
+    } else {
+      console.log(`[settle] ${trade.market} | ${trade.direction} | ${trade.result.toUpperCase()} | P&L: $${trade.pnl.toFixed(2)} | Total: $${state.totalPnL.toFixed(2)}`);
+    }
     saveState();
 
-    // Post-settlement circuit breaker
+    // Post-settlement circuit breaker — use session P&L from wallet if available
     const floor = state.config.pnlFloor ?? -100;
-    if (state.totalPnL <= floor) {
-      console.log(`[circuit-breaker] 🛑 P&L $${state.totalPnL.toFixed(2)} hit floor $${floor} after settlement. Auto-pausing.`);
+    const effectivePnL = (state.sessionStartBalance != null && currentBal >= 0)
+      ? currentBal - state.sessionStartBalance
+      : state.totalPnL;
+    if (effectivePnL <= floor) {
+      console.log(`[circuit-breaker] 🛑 Session P&L $${effectivePnL.toFixed(2)} hit floor $${floor} after settlement. Auto-pausing.`);
       state.paused = true;
       saveState();
-      return; // stop settling further trades
+      return;
     }
   }
 }
@@ -350,6 +439,15 @@ async function onTick(price: number) {
     };
 
     if (!state.config.dryRun && clobClient) {
+      // Snapshot wallet balance BEFORE the order
+      const balBefore = await getWalletBalance();
+      if (balBefore >= 0 && balBefore < cost * 0.9) {
+        console.log(`[bot] ❌ Insufficient balance: $${balBefore.toFixed(2)} < $${cost.toFixed(2)} needed`);
+        checking = false;
+        return;
+      }
+      trade.walletBefore = balBefore;
+
       try {
         const order = await clobClient.createOrder({
           tokenID: tokenId,
@@ -358,10 +456,24 @@ async function onTick(price: number) {
           size,
         });
         const result = await clobClient.postOrder(order);
-        trade.orderId = result?.orderID || result?.id || "unknown";
-        console.log(`[bot] ✅ Order placed: ${trade.orderId}`);
+        const orderId = result?.orderID || result?.id || null;
+
+        // CRITICAL: Verify the order actually went through
+        if (!orderId || orderId === "unknown") {
+          // Check if postOrder returned an error in data
+          const errMsg = result?.error || result?.data?.error || "unknown order ID";
+          console.error(`[bot] ❌ Order NOT filled: ${errMsg}`);
+          checking = false;
+          return;
+        }
+
+        trade.orderId = orderId;
+        trade.conditionId = market.conditionId;
+        console.log(`[bot] ✅ Order filled: ${orderId}`);
       } catch (e: any) {
-        console.error(`[bot] ❌ Order failed: ${e.message}`);
+        // CLOB client may throw OR return error in response
+        const errData = e?.response?.data?.error || e.message;
+        console.error(`[bot] ❌ Order failed: ${errData}`);
         checking = false;
         return;
       }
@@ -425,6 +537,7 @@ app.get("/status", (_req, res) => {
         ? `${((state.wins / (state.wins + state.losses)) * 100).toFixed(1)}%`
         : "N/A",
       totalPnL: `$${state.totalPnL.toFixed(2)}`,
+      sessionStartBalance: state.sessionStartBalance != null ? `$${state.sessionStartBalance.toFixed(2)}` : "unknown",
     },
     config: {
       positionSize: state.config.positionSize,
@@ -454,6 +567,19 @@ app.get("/status", (_req, res) => {
       delta: `$${t.deltaAtEntry?.toFixed(0) ?? "?"}`,
       timeInWindow: `${t.timeInWindow ?? "?"}s`,
     })),
+  });
+});
+
+app.get("/wallet", async (_req, res) => {
+  const bal = await getWalletBalance();
+  const sessionPnL = state.sessionStartBalance != null && bal >= 0
+    ? bal - state.sessionStartBalance
+    : null;
+  res.json({
+    balance: bal >= 0 ? `$${bal.toFixed(2)}` : "error",
+    sessionStartBalance: state.sessionStartBalance != null ? `$${state.sessionStartBalance.toFixed(2)}` : "unknown",
+    sessionPnL: sessionPnL != null ? `$${sessionPnL.toFixed(2)}` : "unknown",
+    calculatedPnL: `$${state.totalPnL.toFixed(2)}`,
   });
 });
 
@@ -542,6 +668,19 @@ async function start() {
   console.log(`  History: ${state.trades.length} trades, ${state.wins}W/${state.losses}L, $${state.totalPnL.toFixed(2)} P&L`);
   console.log("═══════════════════════════════════════════════\n");
 
+  if (!state.config.dryRun) {
+    clobClient = await initClobClient();
+  }
+
+  // Record session start balance from wallet
+  const startBal = await getWalletBalance();
+  if (startBal >= 0) {
+    state.sessionStartBalance = startBal;
+    console.log(`[bot] Session start balance: $${startBal.toFixed(2)} USDC.e`);
+  } else {
+    console.log(`[bot] ⚠️ Could not read wallet balance at start`);
+  }
+
   await priceEngine.bootstrap();
   priceEngine.connectBinance();
   priceEngine.startCoinGeckoPolling();
@@ -552,10 +691,6 @@ async function start() {
       onTick(price);
     }
   });
-
-  if (!state.config.dryRun) {
-    clobClient = await initClobClient();
-  }
 
   app.listen(BOT_PORT, "127.0.0.1", () => {
     console.log(`[api] http://127.0.0.1:${BOT_PORT}`);
