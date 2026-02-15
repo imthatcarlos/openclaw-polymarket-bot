@@ -472,18 +472,41 @@ async function onTick(price: number) {
 
         // CRITICAL: Verify the order actually went through
         if (!orderId || orderId === "unknown") {
-          // Check if postOrder returned an error in data
           const errMsg = result?.error || result?.data?.error || "unknown order ID";
-          console.error(`[bot] ❌ Order NOT filled: ${errMsg}`);
+          console.error(`[bot] ❌ Order NOT placed: ${errMsg}`);
           checking = false;
           return;
         }
 
         trade.orderId = orderId;
         trade.conditionId = market.conditionId;
-        console.log(`[bot] ✅ Order filled: ${orderId}`);
+        console.log(`[bot] 📋 Order on book: ${orderId}`);
+
+        // Wait briefly for matching then verify fill
+        await new Promise(r => setTimeout(r, 3000));
+        
+        try {
+          const orderStatus = await clobClient.getOrder(orderId);
+          const matched = parseInt(orderStatus?.size_matched || "0");
+          const status = orderStatus?.status || "unknown";
+          
+          if (matched === 0) {
+            // Order not filled — cancel it and skip
+            console.error(`[bot] ❌ Order NOT filled (size_matched=0, status=${status}). Canceling.`);
+            try { await clobClient.cancelOrder({ orderID: orderId }); } catch {}
+            checking = false;
+            return;
+          }
+          
+          // Partially or fully filled
+          trade.size = matched;
+          trade.cost = matched * bidPrice;
+          console.log(`[bot] ✅ Order filled: ${matched}/${trade.size} tokens matched (status=${status})`);
+        } catch (e: any) {
+          // If we can't verify, assume it went through but log warning
+          console.log(`[bot] ⚠️ Could not verify fill (${e.message}), proceeding with trade`);
+        }
       } catch (e: any) {
-        // CLOB client may throw OR return error in response
         const errData = e?.response?.data?.error || e.message;
         console.error(`[bot] ❌ Order failed: ${errData}`);
         checking = false;
