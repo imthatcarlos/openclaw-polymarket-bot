@@ -1,188 +1,120 @@
-# Polymarket BTC 5-Min Trading Bot v4
+# Polymarket BTC 5-Min Trading Bot v6.2
 
-Automated trading bot for [Polymarket's](https://polymarket.com) 5-minute Bitcoin Up/Down prediction markets. Pure latency arbitrage with doubling position sizing.
+Automated trading bot for [Polymarket's](https://polymarket.com) 5-minute Bitcoin Up/Down prediction markets. Pure latency arbitrage with Kelly criterion sizing, orderbook-aware pricing, and wallet-verified P&L.
 
 ## How It Works
 
 Every 5 minutes, Polymarket opens a binary market: "Will BTC go up or down in the next 5 minutes?" This bot monitors BTC price in real-time via Binance WebSocket and places trades when the market hasn't yet priced in a BTC move.
 
-### Signal Engine — Pure Latency Arb (v4)
+### Signal Engine — Pure Latency Arb
 
 The bot exploits the latency gap between BTC spot price (Binance) and Polymarket token prices. When BTC makes a sharp move within a 5-minute window but the Polymarket market hasn't caught up, there's free edge.
 
 **How it decides:**
 1. Track BTC price delta from window open (Binance WebSocket, every tick)
-2. Calculate fair value: `0.50 + (deltaPct × 2.5 × timeWeight)`
-3. Compare to current Polymarket token price
-4. Trade if edge > 8¢ and market token < $0.55
+2. Calculate Black-Scholes fair value for the binary option
+3. Fetch real orderbook ask price from CLOB API
+4. Trade only if fair value beats ask price by at least 6¢ edge
+5. Skip if no liquidity at a reasonable price
 
 **Filters:**
-- Min BTC move: 0.06% or $40 absolute
-- Time-scaled threshold: needs 2x bigger move early in window (stale open price risk)
+- Min BTC move: 0.04% or $50 absolute
+- Time-scaled threshold: needs bigger move early in window
 - Trade window: 30s-240s into each 5-min window
-- Market-already-priced filter: skip if token ≥ $0.55
-- 90s cooldown between trades
+- Market-already-priced filter: skip if token ≥ $0.65
+- Edge check: skip if fair value doesn't beat orderbook ask by 5¢+
+- 60s cooldown between trades
 
-### Position Sizing — Doubling Strategy
+### Position Sizing — Quarter Kelly
 
-Instead of fixed sizing, the bot doubles on each consecutive win and resets to base on any loss:
+Uses Kelly criterion for position sizing with a conservative quarter-Kelly fraction:
 
-| Streak | Bet Size |
-|--------|----------|
-| 0 (base/after loss) | $100 |
-| 1 win | $200 |
-| 2 wins | $400 |
-| 3 wins | $800 |
-| 4 wins | $1,600 |
-| 5 wins | $3,200 |
-| 6 wins | $6,400 |
-| 7+ wins | $10,000 (cap) |
+- `f* = (p*b - q) / b` where p=win rate, b=payout ratio, q=loss rate
+- Applied fraction: 25% of full Kelly
+- Floor: $100 per trade
+- Cap: $10,000 per trade
+- Sizes down to available wallet balance (min $5) instead of skipping
 
-**Why this works:** With a 72%+ win rate, long streaks are common. A 10-win streak starting at $100 yields ~$70K. Losses are always at base ($100) or wherever the streak breaks, limiting downside.
+### Order Execution
 
-**Backtested on 49 actual trades:** $53,785 P&L with $10K cap (started at $50 base).
+- **Orderbook-aware pricing (v6.2)**: Fetches real ask prices from Polymarket CLOB API instead of guessing
+- **Fill verification**: Rejects orders with "unknown" IDs, checks `size_matched > 0`
+- **Auto-cancel**: Unfilled orders are canceled immediately
 
-### Architecture
+### Settlement & Redemption
+
+- **Auto-settle**: Queries Gamma API after window closes to determine win/loss
+- **Auto-redeem**: Winning positions redeemed via CTF `redeemPositions` contract call
+- **Dynamic gas**: Fetches current Polygon gas price + 30% buffer (no hardcoded caps)
+- **Wallet-based P&L**: Tracks `walletBefore`/`walletAfter` per trade, session P&L from balance delta
+
+## Architecture
 
 ```
-┌─────────────────────────────────────────┐
-│  Persistent Node.js Process             │
-│                                         │
-│  ┌──────────┐  ┌──────────────────┐     │
-│  │ Binance  │  │  Signal Engine   │     │
-│  │ WebSocket├──┤  Pure Latency    │     │
-│  │ (ticks)  │  │  Arbitrage       │     │
-│  └──────────┘  └────────┬─────────┘     │
-│                         │               │
-│  ┌──────────┐  ┌────────▼─────────┐     │
-│  │ CoinGecko│  │  Trade Executor  │     │
-│  │ (30s xck)│  │  Polymarket CLOB │     │
-│  └──────────┘  └────────┬─────────┘     │
-│                         │               │
-│  ┌──────────┐  ┌────────▼─────────┐     │
-│  │ HTTP API │  │  Auto-Settlement │     │
-│  │ :3847    │  │  + Post-Mortems  │     │
-│  └──────────┘  └──────────────────┘     │
-└─────────────────────────────────────────┘
-         │
-         ▼ (via EU proxy)
-   Polymarket CLOB API
+Binance WebSocket → Price Engine → Signal Engine → CLOB Order → Settlement → Auto-Redeem
+                                        ↓
+                                  Orderbook Check
+                                  (real ask price)
+                                        ↓
+                                   Edge Filter
+                                (fair value > ask?)
 ```
 
-## Setup
+**Persistent Node.js process** with HTTP control API at `:3847`.
 
-### Prerequisites
-
-- Node.js 20+
-- A Polygon wallet with USDC.e balance
-- USDC.e approved for Polymarket's CTF Exchange and Neg Risk Exchange contracts
-
-### Environment Variables
-
-Create a `.env` file:
-
-```bash
-# Required
-EVM_PRIVATE_KEY=        # Polygon wallet private key
-
-# Proxy (required from US — Polymarket CLOB is geo-blocked)
-PROXY_URL=              # EU proxy URL
-PROXY_SECRET=           # Proxy authentication secret
-
-# Optional
-RPC_URL=                # Polygon RPC endpoint (default: polygon-rpc.com)
-BOT_PORT=               # HTTP API port (default: 3847)
-```
-
-### USDC.e Approvals
-
-```bash
-EVM_PRIVATE_KEY=0x... RPC_URL=... npx tsx skill/scripts/approve-usdc.ts
-```
-
-### Install & Run
-
-```bash
-npm install
-
-# Start (loads .env automatically)
-export $(cat .env | xargs) && npx tsx src/bot.ts
-
-# Or background:
-export $(cat .env | xargs) && nohup npx tsx src/bot.ts > bot.log 2>&1 &
-```
-
-## HTTP API
+### API Endpoints
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/status` | GET | Bot state, streak, signal, stats, P&L |
-| `/trades` | GET | Recent trade history (last 50) |
-| `/stats/hourly` | GET | Win rate and P&L by hour (UTC) |
-| `/post-mortems` | GET | Loss pattern analysis |
+| `/status` | GET | Full bot status, signal, config |
+| `/trades` | GET | Trade history |
+| `/wallet` | GET | Live balance, session P&L |
+| `/stats/hourly` | GET | Hourly performance breakdown |
+| `/post-mortems` | GET | Loss analysis log |
+| `/config` | POST | Update config without restart |
 | `/pause` | POST | Pause trading |
 | `/resume` | POST | Resume trading |
-| `/config` | POST | Update config live (JSON body) |
 | `/stop` | POST | Graceful shutdown |
 
-### Config Parameters
+## Setup
 
 ```bash
-curl -X POST http://127.0.0.1:3847/config \
-  -H "Content-Type: application/json" \
-  -d '{"positionSize": 100, "maxPositionSize": 10000}'
+cp .env.example .env
+# Fill in: EVM_PRIVATE_KEY, WALLET_ADDRESS, PROXY_URL, PROXY_SECRET, RPC_URL
+npm install
 ```
 
-| Param | Default | Description |
-|-------|---------|-------------|
-| `positionSize` | 100 | Base bet size (USD) |
-| `maxPositionSize` | 10000 | Max bet size cap |
-| `pnlFloor` | -100 | Circuit breaker — auto-pause if P&L drops below |
-| `minDeltaPercent` | 0.06 | Min BTC % move to trigger |
-| `minDeltaAbsolute` | 40 | Min BTC $ move to trigger |
-| `minEdgeCents` | 8 | Min edge vs market price (cents) |
-| `maxTokenPrice` | 0.55 | Skip if market already priced in |
-| `cooldownMs` | 90000 | Min ms between trades |
-| `maxPrice` | 0.65 | Max bid price per token |
-| `dryRun` | false | Simulate without placing orders |
+## Running
+
+```bash
+# Load env and start
+export $(cat .env | xargs) && npx tsx src/bot.ts
+
+# For persistence (survives session close)
+nohup bash -c 'cd /path/to/bot && export $(cat .env | xargs) && npx tsx src/bot.ts' > /tmp/polymarket-bot.log 2>&1 &
+```
 
 ## Signal Evolution
 
 | Version | Strategy | Result |
 |---------|----------|--------|
-| v1-v2 | StochRSI + Momentum + EMA20 | ~50% win rate, no edge |
-| v3 | Pure latency arb (event-driven) | 72% win rate |
-| v4 | Pure latency arb + doubling sizing | 72% WR, optimized P&L via streak sizing |
+| v1-v2 | Technical indicators (RSI, StochRSI) | ~50% WR, no edge |
+| v3 | Pure latency arb | ~72.5% WR |
+| v4 | + Doubling position sizing | Peak +$1,681, gave it all back |
+| v5 | + Kelly criterion sizing | +$148 real (7 trades), +$428 phantom |
+| v6 | + Wallet verification, order fill check, auto-redeem | Fixed phantom trades |
+| v6.2 | + Orderbook ask pricing, edge check, dynamic gas | Current |
 
-Key insight: Technical indicators (RSI, momentum, mean-reversion) had no edge on 5-minute windows. Latency arbitrage consistently wins because Polymarket token prices lag BTC spot.
+## Key Lessons
 
-## Project Structure
+- **Phantom trades**: Orders can return 400 but bot logged them as placed. Always verify `size_matched > 0`.
+- **Auto-redeem is critical**: Winning tokens lock USDC in CTF contract. Must redeem to free capital.
+- **Polygon gas spikes**: Hardcoded gas caps cause stuck TXs. Always fetch current gas dynamically.
+- **Orderbook > mid price**: Gamma API `outcomePrices` is mid-market, not executable. Fetch real asks from CLOB.
+- **Overnight is king**: UTC 03-05, 11-12 had 100% win rates. UTC 13 (8am ET) was worst.
 
-```
-├── src/
-│   ├── bot.ts              # Main process, HTTP API, doubling logic
-│   ├── price-engine.ts     # Binance WebSocket + CoinGecko cross-check
-│   ├── market-engine.ts    # Polymarket market discovery + settlement
-│   ├── signal-engine.ts    # Pure latency arb signal generation
-│   └── indicators.ts       # Technical indicator calculations
-├── skill/                  # OpenClaw skill (v1 standalone)
-├── state.json              # Persisted state (trades, P&L, streak)
-├── post-mortems.jsonl      # Auto-logged loss analysis
-└── .env                    # Secrets (not committed)
-```
+## Requirements
 
-## EU Proxy
-
-Polymarket's CLOB API is geo-blocked from the US. The bot routes requests through an EU proxy (Netherlands) deployed on Railway. Configure via `PROXY_URL` and `PROXY_SECRET`.
-
-## Risk Warning
-
-- Binary outcomes — you can lose your entire position on every trade
-- Doubling amplifies both wins AND losses
-- The circuit breaker (`pnlFloor`) is your safety net — don't disable it
-- This is experimental software — use at your own risk
-- Not financial advice
-
-## License
-
-MIT
+- EU proxy for Polymarket CLOB API (geo-blocked in US)
+- Polygon wallet with USDC.e + MATIC for gas
+- USDC.e approved on CTF Exchange + Neg Risk Exchange contracts
