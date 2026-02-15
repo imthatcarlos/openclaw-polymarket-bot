@@ -389,17 +389,11 @@ async function onTick(price: number) {
       return;
     }
 
-    // Execute trade — bid at token mid price + spread to cross
-    // Polymarket binary CLOB: UP book has only bids, no asks. To buy UP you place a BUY
-    // order and it matches against the other side. Effective cost ≈ mid price.
-    // The complementary token's best bid = 1 - effective ask for our token.
+    // Execute trade — bid at mid price + small spread
+    // Gamma mid price is most reliable. Bid mid + 3¢ to cross the spread.
     const tokenPrice = signal.direction === "UP" ? market.upPrice : market.downPrice;
-    const complementaryBid = signal.direction === "UP" ? market.downBestBid : market.upBestBid;
-    // Effective ask = 1 - complementary best bid (what it actually costs to buy our token)
-    const effectiveAsk = complementaryBid > 0 ? parseFloat((1 - complementaryBid).toFixed(2)) : tokenPrice;
-    // Bid slightly above effective ask to ensure fill
-    const bidPrice = Math.min(parseFloat(Math.max(effectiveAsk + 0.02, tokenPrice + 0.02).toFixed(2)), state.config.maxPrice);
-    console.log(`[bid] mid=$${tokenPrice.toFixed(2)} compBid=$${complementaryBid.toFixed(2)} effAsk=$${effectiveAsk.toFixed(2)} → bidding $${bidPrice}`);
+    const bidPrice = Math.min(parseFloat((tokenPrice + 0.03).toFixed(2)), state.config.maxPrice);
+    console.log(`[bid] mid=$${tokenPrice.toFixed(2)} → bidding $${bidPrice}`);
 
     // Kelly-adjacent sizing: bet a fraction of bankroll based on edge
     // Kelly f* = (p*b - q) / b where p=win%, b=payout ratio, q=loss%
