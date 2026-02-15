@@ -441,19 +441,31 @@ async function onTick(price: number) {
     if (!state.config.dryRun && clobClient) {
       // Snapshot wallet balance BEFORE the order
       const balBefore = await getWalletBalance();
-      if (balBefore >= 0 && balBefore < cost * 0.9) {
-        console.log(`[bot] ❌ Insufficient balance: $${balBefore.toFixed(2)} < $${cost.toFixed(2)} needed`);
-        checking = false;
-        return;
-      }
       trade.walletBefore = balBefore;
+
+      // If balance is less than planned cost, size down to what we have (keep $1 buffer for rounding)
+      if (balBefore >= 0 && balBefore < cost) {
+        const availableCost = Math.floor((balBefore - 1) * 100) / 100;
+        if (availableCost < 5) {
+          console.log(`[bot] ❌ Wallet too low: $${balBefore.toFixed(2)}, need at least $5`);
+          checking = false;
+          return;
+        }
+        const newSize = Math.floor(availableCost / bidPrice);
+        const newCost = newSize * bidPrice;
+        console.log(`[bot] ⚠️ Sizing down: $${cost.toFixed(2)} → $${newCost.toFixed(2)} (wallet: $${balBefore.toFixed(2)})`);
+        trade.size = newSize;
+        trade.cost = newCost;
+        // Update locals for order
+        Object.assign(trade, { size: newSize, cost: newCost });
+      }
 
       try {
         const order = await clobClient.createOrder({
           tokenID: tokenId,
           price: bidPrice,
           side: "BUY" as any,
-          size,
+          size: trade.size,
         });
         const result = await clobClient.postOrder(order);
         const orderId = result?.orderID || result?.id || null;
