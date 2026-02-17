@@ -359,9 +359,10 @@ async function onTick(price) {
         // ── Price check: is entry price acceptable? ──
         let bidPrice;
         if (bestAsk > 0 && bestAsk <= state.config.maxEntryPrice) {
-            bidPrice = bestAsk;
-            const expectedProfit = (1.0 - bidPrice) * 100; // cents per token
-            reasons.push(`Entry: $${bidPrice.toFixed(2)} (ask, ${askDepth.toFixed(0)} depth) | Expected profit: ${expectedProfit.toFixed(0)}¢/token`);
+            // Bid 2¢ above best ask to guarantee fill (cross the spread aggressively)
+            bidPrice = Math.min(bestAsk + 0.02, state.config.maxEntryPrice);
+            const expectedProfit = (1.0 - bidPrice) * 100;
+            reasons.push(`Entry: $${bidPrice.toFixed(2)} (ask $${bestAsk.toFixed(2)} + 2¢, ${askDepth.toFixed(0)} depth) | Profit: ${expectedProfit.toFixed(0)}¢/token`);
         }
         else if (bestAsk > state.config.maxEntryPrice) {
             reasons.push(`SKIP: Ask $${bestAsk.toFixed(2)} > max $${state.config.maxEntryPrice} — too expensive`);
@@ -371,10 +372,11 @@ async function onTick(price) {
             return;
         }
         else {
-            // No ask data — use mid + conservative offset
+            // No ask data — use mid + 15¢ to aggressively cross spread
+            // At 240s+ with $50+ delta, mid is unreliable. Overpay slightly to guarantee fill.
             const midPrice = direction === "UP" ? market.upPrice : market.downPrice;
-            bidPrice = Math.min(midPrice + 0.05, state.config.maxEntryPrice);
-            reasons.push(`Entry: $${bidPrice.toFixed(2)} (fallback, no ask data) | Mid: $${midPrice.toFixed(2)}`);
+            bidPrice = Math.min(parseFloat((midPrice + 0.15).toFixed(2)), state.config.maxEntryPrice);
+            reasons.push(`Entry: $${bidPrice.toFixed(2)} (mid $${midPrice.toFixed(2)} + 15¢, no ask data) | Profit: ${((1.0 - bidPrice) * 100).toFixed(0)}¢/token`);
         }
         // ── Confidence check: is profit margin worth the risk? ──
         const profitPerToken = 1.0 - bidPrice;
