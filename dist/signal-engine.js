@@ -34,7 +34,7 @@ export const DEFAULT_CONFIG = {
     pnlFloor: -100, // auto-pause at -$100
 };
 export function generateSignal(windowOpenPrice, currentPrice, marketUpPrice, marketDownPrice, timeInWindow, // seconds into 5-min window (0-300)
-config = DEFAULT_CONFIG) {
+config = DEFAULT_CONFIG, bestAsks) {
     const reasons = [];
     let direction = null;
     let confidence = 0;
@@ -74,12 +74,16 @@ config = DEFAULT_CONFIG) {
     const arbDirection = delta > 0 ? "UP" : "DOWN";
     const tokenPrice = arbDirection === "UP" ? marketUpPrice : marketDownPrice;
     marketPrices.impliedProb = tokenPrice; // token price ≈ implied probability
-    const edge = fairValue - tokenPrice;
-    reasons.push(`Market: UP=$${marketUpPrice.toFixed(2)} DOWN=$${marketDownPrice.toFixed(2)}`);
-    reasons.push(`BS Fair: $${fairValue.toFixed(3)} (d2=${bs.d2.toFixed(2)}, σ=${annualizedVol}, ${timeRemainingSeconds}s left) | Token: $${tokenPrice.toFixed(2)} | Edge: ${(edge * 100).toFixed(1)}¢`);
+    // Real orderbook ask = what we'd actually pay to enter
+    const realAsk = bestAsks ? (arbDirection === "UP" ? bestAsks.up : bestAsks.down) : 0;
+    const entryPrice = realAsk > 0 ? realAsk : tokenPrice;
+    const edge = fairValue - entryPrice;
+    reasons.push(`Market: UP=$${marketUpPrice.toFixed(2)} DOWN=$${marketDownPrice.toFixed(2)}${realAsk > 0 ? ` | Ask=$${realAsk.toFixed(2)}` : ''}`);
+    reasons.push(`BS Fair: $${fairValue.toFixed(3)} (d2=${bs.d2.toFixed(2)}, σ=${annualizedVol}, ${timeRemainingSeconds}s left) | Entry: $${entryPrice.toFixed(2)} | Edge: ${(edge * 100).toFixed(1)}¢`);
     // ── Filters ──
-    if (tokenPrice >= config.maxTokenPrice) {
-        reasons.push(`SKIP: Market already priced in (${tokenPrice.toFixed(2)} >= ${config.maxTokenPrice})`);
+    const effectivePrice = realAsk > 0 ? realAsk : tokenPrice;
+    if (effectivePrice >= config.maxTokenPrice) {
+        reasons.push(`SKIP: Market already priced in (${realAsk > 0 ? 'ask' : 'mid'}=$${effectivePrice.toFixed(2)} >= ${config.maxTokenPrice})`);
         return { direction: null, confidence: 0, reasons, priceDelta, marketPrices, timeInWindow, timestamp: Date.now() };
     }
     // Market agreement filter — but override on massive deltas (>$150)
@@ -100,7 +104,7 @@ config = DEFAULT_CONFIG) {
     confidence = Math.min(0.95, 0.6 + edge);
     // Kelly Criterion: F = (p - P) / (1 - P)
     // p = our fair value estimate, P = market token price
-    const kellyFull = (fairValue - tokenPrice) / (1 - tokenPrice);
+    const kellyFull = (fairValue - entryPrice) / (1 - entryPrice);
     const kellyBet = Math.max(config.minPositionSize, Math.min(config.positionSize, config.bankroll * kellyFull * config.kellyFraction));
     reasons.push(`🎯 LATENCY ARB: ${arbDirection} | BTC ${delta > 0 ? "up" : "down"} $${absDelta.toFixed(0)} but market at ${(tokenPrice * 100).toFixed(0)}%`);
     reasons.push(`Kelly: F=${(kellyFull * 100).toFixed(1)}% × ${config.kellyFraction} bankroll → $${kellyBet.toFixed(2)}`);

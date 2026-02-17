@@ -403,14 +403,15 @@ async function onTick(price: number) {
       console.log(`[book] REST UP: bid=$${market.upBestBid} ask=$${market.upBestAsk}(${market.upAskDepth.toFixed(0)}) | DOWN: bid=$${market.downBestBid} ask=$${market.downBestAsk}(${market.downAskDepth.toFixed(0)}) | mid: UP=$${market.upPrice} DOWN=$${market.downPrice}`);
     }
 
-    // Generate signal
+    // Generate signal — pass real orderbook asks so signal engine knows actual entry cost
     const signal = generateSignal(
       windowOpenPrice,
       price,
       market.upPrice,
       market.downPrice,
       timeInWindow,
-      state.config
+      state.config,
+      { up: market.upBestAsk, down: market.downBestAsk }
     );
     lastSignal = signal;
 
@@ -440,8 +441,13 @@ async function onTick(price: number) {
       // Use real best ask from orderbook — this is the price to cross the spread
       bidPrice = bestAsk;
       console.log(`[bid] mid=$${tokenPrice.toFixed(2)} | bestAsk=$${bestAsk} (${askDepth.toFixed(0)} tokens) → bidding $${bidPrice}`);
+    } else if (bestAsk > state.config.maxPrice) {
+      // Ask exists but too expensive — no edge, skip trade
+      console.log(`[bid] SKIP: bestAsk=$${bestAsk} exceeds maxPrice=$${state.config.maxPrice} — MMs already repriced`);
+      checking = false;
+      return;
     } else {
-      // Fallback: mid + 5¢ if orderbook data unavailable
+      // No orderbook data at all — use mid + 5¢ as last resort
       bidPrice = Math.min(parseFloat((tokenPrice + 0.05).toFixed(2)), state.config.maxPrice);
       console.log(`[bid] mid=$${tokenPrice.toFixed(2)} | no ask data → fallback bidding $${bidPrice}`);
     }
