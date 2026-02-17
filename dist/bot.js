@@ -21,10 +21,10 @@ const CTF_ADDRESS = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045";
 const WALLET_ADDRESS = process.env.WALLET_ADDRESS || "0x1a1E1b82Da7E91E9567a40b0f952748b586389F9";
 // ── Loss Pattern Categorization ─────────────────────────────
 function categorizeLoss(trade) {
-    if (trade.timeInWindow < 120)
+    if (trade.timeInWindow < 90)
         return "ARB_TOO_EARLY";
-    if (trade.timeInWindow >= 120 && trade.timeInWindow < 200)
-        return "ARB_MID_WINDOW";
+    if (trade.timeInWindow >= 90 && trade.timeInWindow <= 150)
+        return "ARB_SWEET_SPOT";
     if (Math.abs(trade.deltaAtEntry) < 50)
         return "ARB_SMALL_MOVE";
     if (trade.tokenPriceAtEntry > 0.52)
@@ -303,9 +303,21 @@ async function onTick(price) {
     // Cooldown after trade completes (win or loss)
     if (Date.now() - lastTradeTime < state.config.cooldownMs)
         return;
-    // Wide-late window: 120-270s (skip first 2 min of stale prices, skip last 30s)
-    if (timeInWindow < 120 || timeInWindow > 270)
+    // Sweet spot window: 90-150s
+    // Too early (<90s): BTC hasn't committed, signal unreliable
+    // Sweet spot (90-150s): Move confirmed, MMs haven't fully repriced (especially overnight)
+    // Too late (>150s): MMs caught up, orderbook already reflects the move
+    if (timeInWindow < 90 || timeInWindow > 150)
         return;
+    // Overnight filter: only trade UTC 22-06 when MM repricing is slower
+    const hourUTC = new Date().getUTCHours();
+    const isOvernight = hourUTC >= 22 || hourUTC <= 6;
+    if (!isOvernight) {
+        // During active hours, MMs reprice instantly — no edge
+        if (tickCount % 300 === 1)
+            console.log(`[skip] Active hours (UTC ${hourUTC}), overnight-only mode`);
+        return;
+    }
     checking = true;
     checkCount++;
     try {
