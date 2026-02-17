@@ -42,6 +42,7 @@ export class PriceEngine extends EventEmitter {
     upAskDepth: 0, downAskDepth: 0, lastUpdate: 0,
   };
   private polyTokenMap: Map<string, "UP" | "DOWN"> = new Map();
+  public windowOpenPrices: Map<number, number> = new Map();
 
   async bootstrap() {
     // Seed with REST data from Binance.us (REST still works, just WS is dead)
