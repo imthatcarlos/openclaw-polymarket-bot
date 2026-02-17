@@ -42,7 +42,7 @@ export async function findCurrentMarket(): Promise<MarketInfo | null> {
   const timeIntoWindow = now - currentWindowStart;
 
   // Only trade current window, skip if >4 min in (arb can trade later)
-  if (timeIntoWindow > 240) return null;
+  if (timeIntoWindow > 295) return null;  // Allow trades up to 295s (v8 Last Look needs 240-290s)
 
   const slug = `btc-updown-5m-${currentWindowStart}`;
 
