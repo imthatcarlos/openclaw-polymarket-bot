@@ -82,11 +82,14 @@ config = DEFAULT_CONFIG) {
         reasons.push(`SKIP: Market already priced in (${tokenPrice.toFixed(2)} >= ${config.maxTokenPrice})`);
         return { direction: null, confidence: 0, reasons, priceDelta, marketPrices, timeInWindow, timestamp: Date.now() };
     }
-    // POST-MORTEM: All 3 losses had token at 0.49-0.505 (market saying ~50/50 or slightly against us).
-    // Only enter when market at least slightly agrees with our direction (token >= 0.50).
-    if (tokenPrice < 0.50) {
+    // Market agreement filter — but override on massive deltas (>$150)
+    // Rationale: small deltas ($55-$110) reverse often, trust market. Huge deltas ($150+) hold.
+    if (tokenPrice < 0.50 && absDelta < 150) {
         reasons.push(`SKIP: Market disagrees (token $${tokenPrice.toFixed(2)} < $0.50 — market doesn't see this direction)`);
         return { direction: null, confidence: 0, reasons, priceDelta, marketPrices, timeInWindow, timestamp: Date.now() };
+    }
+    if (tokenPrice < 0.50 && absDelta >= 150) {
+        reasons.push(`⚡ DELTA OVERRIDE: Market disagrees but delta $${absDelta.toFixed(0)} > $150 — trusting the move`);
     }
     if (edge < config.minEdgeCents / 100) {
         reasons.push(`SKIP: Edge too small (${(edge * 100).toFixed(1)}¢ < ${config.minEdgeCents}¢)`);

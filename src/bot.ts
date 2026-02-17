@@ -141,6 +141,7 @@ function loadState(): BotState {
         winStreak: s.winStreak ?? 0,
         skips: s.skips ?? 0,
         paused: s.paused ?? false,
+        sessionStartBalance: s.sessionStartBalance ?? undefined,
       };
     } catch {}
   }
@@ -158,6 +159,7 @@ function saveState() {
       winStreak: state.winStreak,
       skips: state.skips,
       paused: state.paused,
+      sessionStartBalance: state.sessionStartBalance,
     }, null, 2));
   } catch {}
 }
@@ -348,8 +350,8 @@ async function onTick(price: number) {
   // Cooldown after trade completes (win or loss)
   if (Date.now() - lastTradeTime < state.config.cooldownMs) return;
 
-  // Don't trade first 30s (window open price might be stale) or last 60s (resolution too close)
-  if (timeInWindow < 30 || timeInWindow > 240) return;
+  // Wide-late window: 120-270s (skip first 2 min of stale prices, skip last 30s)
+  if (timeInWindow < 120 || timeInWindow > 270) return;
 
   checking = true;
   checkCount++;
@@ -361,6 +363,9 @@ async function onTick(price: number) {
     // Get market prices
     const market = await findCurrentMarket();
     if (!market) { checking = false; return; }
+
+    // Log orderbook state
+    console.log(`[book] UP: bid=$${market.upBestBid} ask=$${market.upBestAsk}(${market.upAskDepth.toFixed(0)}) | DOWN: bid=$${market.downBestBid} ask=$${market.downBestAsk}(${market.downAskDepth.toFixed(0)}) | mid: UP=$${market.upPrice} DOWN=$${market.downPrice}`);
 
     // Generate signal
     const signal = generateSignal(
@@ -389,30 +394,35 @@ async function onTick(price: number) {
       return;
     }
 
-    // Execute trade — bid at mid price + small spread
-    // Gamma mid price is most reliable. Bid mid + 3¢ to cross the spread.
+    // Execute trade — use real orderbook best ask to cross the spread
     const tokenPrice = signal.direction === "UP" ? market.upPrice : market.downPrice;
-    const bidPrice = Math.min(parseFloat((tokenPrice + 0.03).toFixed(2)), state.config.maxPrice);
-    console.log(`[bid] mid=$${tokenPrice.toFixed(2)} → bidding $${bidPrice}`);
+    const bestAsk = signal.direction === "UP" ? market.upBestAsk : market.downBestAsk;
+    const askDepth = signal.direction === "UP" ? market.upAskDepth : market.downAskDepth;
+    
+    let bidPrice: number;
+    if (bestAsk > 0 && bestAsk <= state.config.maxPrice) {
+      // Use real best ask from orderbook — this is the price to cross the spread
+      bidPrice = bestAsk;
+      console.log(`[bid] mid=$${tokenPrice.toFixed(2)} | bestAsk=$${bestAsk} (${askDepth.toFixed(0)} tokens) → bidding $${bidPrice}`);
+    } else {
+      // Fallback: mid + 5¢ if orderbook data unavailable
+      bidPrice = Math.min(parseFloat((tokenPrice + 0.05).toFixed(2)), state.config.maxPrice);
+      console.log(`[bid] mid=$${tokenPrice.toFixed(2)} | no ask data → fallback bidding $${bidPrice}`);
+    }
 
     // Kelly-adjacent sizing: bet a fraction of bankroll based on edge
     // Kelly f* = (p*b - q) / b where p=win%, b=payout ratio, q=loss%
     // With 72% WR and ~0.7 payout: full Kelly ~32%. We use quarter Kelly for safety.
-    const baseSize = state.config.positionSize;
-    const maxPositionSize = state.config.maxPositionSize ?? 10000;
-    const kellyFraction = state.config.kellyFraction ?? 0.25; // quarter Kelly
-    const bankroll = state.config.bankroll ?? 500;
+    const minBet = state.config.positionSize;  // floor (default $100)
+    const maxBet = state.config.maxPositionSize ?? 10000;
+    const compoundPct = state.config.compoundFraction ?? 0.35; // 35% of wallet per trade
     
-    // Effective bankroll = initial bankroll + cumulative P&L (never below baseSize)
-    const effectiveBankroll = Math.max(bankroll + state.totalPnL, baseSize);
-    const winRate = state.wins / Math.max(state.wins + state.losses, 1);
-    const payoutRatio = 0.7; // avg ~70% return on winning trades at ~51¢ entry
-    const kellyOptimal = Math.max((winRate * payoutRatio - (1 - winRate)) / payoutRatio, 0);
-    const tradeSize = Math.min(
-      Math.max(effectiveBankroll * kellyOptimal * kellyFraction, baseSize),
-      maxPositionSize
-    );
-    console.log(`[kelly] bankroll=$${effectiveBankroll.toFixed(0)} × kelly=${(kellyOptimal*100).toFixed(1)}% × ${kellyFraction} = $${tradeSize.toFixed(2)} (floor $${baseSize}, cap $${maxPositionSize})`);
+    // Use ACTUAL wallet balance for sizing — compound on real money
+    let walletBalance = await getWalletBalance();
+    if (walletBalance < 0) walletBalance = state.config.bankroll ?? 500; // fallback
+    
+    const tradeSize = Math.min(Math.max(walletBalance * compoundPct, minBet), maxBet);
+    console.log(`[compound] wallet=$${walletBalance.toFixed(0)} × ${(compoundPct*100).toFixed(0)}% = $${tradeSize.toFixed(2)} (floor $${minBet}, cap $${maxBet})`);
 
     const size = Math.floor(tradeSize / bidPrice);
     if (size < 1) { checking = false; return; }
@@ -587,14 +597,9 @@ app.get("/status", (_req, res) => {
       maxPositionSize: state.config.maxPositionSize ?? 10000,
       pnlFloor: state.config.pnlFloor ?? -100,
       winStreak: state.winStreak ?? 0,
-      effectiveSize: (() => {
-        const br = Math.max((state.config.bankroll ?? 500) + state.totalPnL, state.config.positionSize);
-        const wr = state.wins / Math.max(state.wins + state.losses, 1);
-        const ko = Math.max((wr * 0.7 - (1 - wr)) / 0.7, 0);
-        const kf = state.config.kellyFraction ?? 0.25;
-        return `$${Math.min(Math.max(br * ko * kf, state.config.positionSize), state.config.maxPositionSize ?? 10000).toFixed(0)}`;
-      })(),
-      sizingMode: "kelly",
+      effectiveSize: `${((state.config.compoundFraction ?? 0.35) * 100).toFixed(0)}% of wallet`,
+      sizingMode: "compound",
+      compoundPct: state.config.compoundFraction ?? 0.35,
       minDeltaPercent: state.config.minDeltaPercent,
       minDeltaAbsolute: state.config.minDeltaAbsolute,
       minEdgeCents: state.config.minEdgeCents,
@@ -715,13 +720,17 @@ async function start() {
     clobClient = await initClobClient();
   }
 
-  // Record session start balance from wallet
-  const startBal = await getWalletBalance();
-  if (startBal >= 0) {
-    state.sessionStartBalance = startBal;
-    console.log(`[bot] Session start balance: $${startBal.toFixed(2)} USDC.e`);
+  // Record session start balance from wallet (preserve if already set in state.json)
+  if (state.sessionStartBalance != null && state.sessionStartBalance > 0) {
+    console.log(`[bot] Session start balance (preserved): $${state.sessionStartBalance.toFixed(2)} USDC.e`);
   } else {
-    console.log(`[bot] ⚠️ Could not read wallet balance at start`);
+    const startBal = await getWalletBalance();
+    if (startBal >= 0) {
+      state.sessionStartBalance = startBal;
+      console.log(`[bot] Session start balance: $${startBal.toFixed(2)} USDC.e`);
+    } else {
+      console.log(`[bot] ⚠️ Could not read wallet balance at start`);
+    }
   }
 
   await priceEngine.bootstrap();

@@ -16,6 +16,10 @@ export interface MarketInfo {
   downPrice: number;
   upBestBid: number;   // highest buy offer on this token's book
   downBestBid: number; // highest buy offer on this token's book
+  upBestAsk: number;   // lowest sell offer on this token's book
+  downBestAsk: number; // lowest sell offer on this token's book
+  upAskDepth: number;  // total size available at best ask
+  downAskDepth: number;
   acceptingOrders: boolean;
 }
 
@@ -64,26 +68,40 @@ export async function findCurrentMarket(): Promise<MarketInfo | null> {
     const upMid = parseFloat(outcomePrices[upIdx >= 0 ? upIdx : 0]);
     const downMid = parseFloat(outcomePrices[downIdx >= 0 ? downIdx : 1]);
 
-    // Fetch orderbook best bids for each token
-    // In binary markets, effective ask for token A = 1 - best bid on token B
-    let upBestBid = 0;
-    let downBestBid = 0;
+    // Fetch orderbook for both tokens — get best bids AND best asks
+    let upBestBid = 0, downBestBid = 0;
+    let upBestAsk = 0, downBestAsk = 0;
+    let upAskDepth = 0, downAskDepth = 0;
     try {
       const upBookRes = await proxiedFetch(`https://clob.polymarket.com/book?token_id=${upTokenId}`);
       if (upBookRes.ok) {
         const book = await upBookRes.json() as any;
         const bids = book?.bids || [];
+        const asks = book?.asks || [];
         if (bids.length > 0) {
-          // Best bid = highest price (bids sorted descending by CLOB, but let's be safe)
           upBestBid = Math.max(...bids.map((b: any) => parseFloat(b.price)));
+        }
+        if (asks.length > 0) {
+          // Best ask = lowest price
+          const sortedAsks = asks.map((a: any) => ({ price: parseFloat(a.price), size: parseFloat(a.size) }))
+            .sort((a: any, b: any) => a.price - b.price);
+          upBestAsk = sortedAsks[0].price;
+          upAskDepth = sortedAsks[0].size;
         }
       }
       const downBookRes = await proxiedFetch(`https://clob.polymarket.com/book?token_id=${downTokenId}`);
       if (downBookRes.ok) {
         const book = await downBookRes.json() as any;
         const bids = book?.bids || [];
+        const asks = book?.asks || [];
         if (bids.length > 0) {
           downBestBid = Math.max(...bids.map((b: any) => parseFloat(b.price)));
+        }
+        if (asks.length > 0) {
+          const sortedAsks = asks.map((a: any) => ({ price: parseFloat(a.price), size: parseFloat(a.size) }))
+            .sort((a: any, b: any) => a.price - b.price);
+          downBestAsk = sortedAsks[0].price;
+          downAskDepth = sortedAsks[0].size;
         }
       }
     } catch (e) {
@@ -103,6 +121,10 @@ export async function findCurrentMarket(): Promise<MarketInfo | null> {
       downPrice: downMid,
       upBestBid,
       downBestBid,
+      upBestAsk,
+      downBestAsk,
+      upAskDepth,
+      downAskDepth,
       acceptingOrders: market.acceptingOrders ?? true,
     };
   } catch (e) {
