@@ -1,6 +1,7 @@
 /**
- * Price Engine — maintains rolling candle buffer from Binance WebSocket
- * and tracks Chainlink prices from Polymarket real-time data
+ * Price Engine — maintains rolling candle buffer from Bybit WebSocket
+ * (Binance.us WS silently drops data from this server)
+ * and cross-checks via CoinGecko polling
  */
 
 import WebSocket from "ws";
@@ -17,71 +18,111 @@ export interface Candle {
 }
 
 export class PriceEngine extends EventEmitter {
-  private binanceWs: WebSocket | null = null;
-  private chainlinkWs: WebSocket | null = null;
+  private bybitWs: WebSocket | null = null;
   private candles: Candle[] = [];
   private maxCandles = 120; // 2 hours of 1-min candles
-  public lastBinancePrice = 0;
+  public lastBinancePrice = 0; // keeping field name for compat
   public lastChainlinkPrice = 0;
   public lastPriceTime = 0;
   public connected = { binance: false, chainlink: false };
 
   async bootstrap() {
-    // Seed with REST data first
+    // Seed with REST data from Binance.us (REST still works, just WS is dead)
     console.log("[price] Bootstrapping with Binance REST candles...");
-    const res = await fetch(
-      "https://api.binance.us/api/v3/klines?symbol=BTCUSDT&interval=1m&limit=60"
-    );
-    const klines = (await res.json()) as any[];
-    this.candles = klines.map((k: any) => ({
-      time: k[0],
-      open: parseFloat(k[1]),
-      high: parseFloat(k[2]),
-      low: parseFloat(k[3]),
-      close: parseFloat(k[4]),
-      volume: parseFloat(k[5]),
-      final: true,
-    }));
-    this.lastBinancePrice = this.candles[this.candles.length - 1]?.close ?? 0;
-    console.log(
-      `[price] Bootstrapped ${this.candles.length} candles. Latest: $${this.lastBinancePrice}`
-    );
+    try {
+      const res = await fetch(
+        "https://api.binance.us/api/v3/klines?symbol=BTCUSDT&interval=1m&limit=60"
+      );
+      const klines = (await res.json()) as any[];
+      this.candles = klines.map((k: any) => ({
+        time: k[0],
+        open: parseFloat(k[1]),
+        high: parseFloat(k[2]),
+        low: parseFloat(k[3]),
+        close: parseFloat(k[4]),
+        volume: parseFloat(k[5]),
+        final: true,
+      }));
+      this.lastBinancePrice = this.candles[this.candles.length - 1]?.close ?? 0;
+      console.log(
+        `[price] Bootstrapped ${this.candles.length} candles. Latest: $${this.lastBinancePrice}`
+      );
+    } catch (e: any) {
+      console.error(`[price] Bootstrap failed: ${e.message}. Starting with empty candles.`);
+    }
   }
 
   connectBinance() {
-    const url = "wss://stream.binance.us:9443/ws/btcusdt@kline_1m";
-    console.log("[price] Connecting to Binance WebSocket...");
+    // Using Bybit spot WebSocket — Binance.us WS connects but sends no data
+    const url = "wss://stream.bybit.com/v5/public/spot";
+    console.log("[price] Connecting to Bybit WebSocket...");
 
     const connect = () => {
-      this.binanceWs = new WebSocket(url);
+      this.bybitWs = new WebSocket(url);
 
-      this.binanceWs.on("open", () => {
-        console.log("[price] Binance WS connected");
+      this.bybitWs.on("open", () => {
+        console.log("[price] Bybit WS connected");
         this.connected.binance = true;
         this.emit("binance:connected");
+        // Subscribe to both trades (real-time ticks) and 1-min kline (candle structure)
+        this.bybitWs!.send(JSON.stringify({
+          op: "subscribe",
+          args: ["publicTrade.BTCUSDT", "kline.1.BTCUSDT"],
+        }));
       });
 
-      this.binanceWs.on("message", (data: Buffer) => {
+      this.bybitWs.on("message", (data: Buffer) => {
         try {
           const msg = JSON.parse(data.toString());
-          if (msg.e !== "kline") return;
 
-          const k = msg.k;
+          // Handle subscription confirmation
+          if (msg.op === "subscribe") return;
+
+          // Handle pong
+          if (msg.op === "pong") return;
+
+          if (!msg.data || !msg.topic) return;
+
+          // Handle trade stream — real-time price ticks
+          if (msg.topic === "publicTrade.BTCUSDT") {
+            const trade = msg.data[msg.data.length - 1]; // latest trade
+            if (!trade) return;
+            const price = parseFloat(trade.p);
+            this.lastBinancePrice = price;
+            this.lastPriceTime = Date.now();
+            
+            // Update current candle with trade price
+            const last = this.candles[this.candles.length - 1];
+            if (last && !last.final) {
+              last.close = price;
+              if (price > last.high) last.high = price;
+              if (price < last.low) last.low = price;
+            }
+            
+            this.emit("tick", { source: "binance", price, time: Date.now() });
+            return;
+          }
+
+          // Handle kline stream — candle structure
+          if (!msg.topic.startsWith("kline.")) return;
+
+          const k = msg.data[0];
+          if (!k) return;
+
           const candle: Candle = {
-            time: k.t,
-            open: parseFloat(k.o),
-            high: parseFloat(k.h),
-            low: parseFloat(k.l),
-            close: parseFloat(k.c),
-            volume: parseFloat(k.v),
-            final: k.x,
+            time: parseInt(k.start),
+            open: parseFloat(k.open),
+            high: parseFloat(k.high),
+            low: parseFloat(k.low),
+            close: parseFloat(k.close),
+            volume: parseFloat(k.volume),
+            final: k.confirm === true,
           };
 
           this.lastBinancePrice = candle.close;
           this.lastPriceTime = Date.now();
 
           if (candle.final) {
-            // New completed candle
             const existing = this.candles.findIndex((c) => c.time === candle.time);
             if (existing >= 0) {
               this.candles[existing] = candle;
@@ -91,7 +132,6 @@ export class PriceEngine extends EventEmitter {
             }
             this.emit("candle", candle);
           } else {
-            // Update current candle
             const last = this.candles[this.candles.length - 1];
             if (last && last.time === candle.time) {
               this.candles[this.candles.length - 1] = candle;
@@ -99,22 +139,29 @@ export class PriceEngine extends EventEmitter {
               this.candles.push(candle);
             }
           }
-
-          this.emit("tick", { source: "binance", price: candle.close, time: Date.now() });
         } catch (e) {
           // ignore parse errors
         }
       });
 
-      this.binanceWs.on("close", () => {
-        console.log("[price] Binance WS disconnected. Reconnecting in 5s...");
+      this.bybitWs.on("close", () => {
+        console.log("[price] Bybit WS disconnected. Reconnecting in 5s...");
         this.connected.binance = false;
         setTimeout(connect, 5000);
       });
 
-      this.binanceWs.on("error", (err: Error) => {
-        console.error("[price] Binance WS error:", err.message);
+      this.bybitWs.on("error", (err: Error) => {
+        console.error("[price] Bybit WS error:", err.message);
       });
+
+      // Bybit requires ping every 20s to keep connection alive
+      const pingInterval = setInterval(() => {
+        if (this.bybitWs?.readyState === WebSocket.OPEN) {
+          this.bybitWs.send(JSON.stringify({ op: "ping" }));
+        } else {
+          clearInterval(pingInterval);
+        }
+      }, 20_000);
     };
 
     connect();
@@ -122,13 +169,12 @@ export class PriceEngine extends EventEmitter {
 
   /**
    * CoinGecko polling as cross-check (every 30s)
-   * Polymarket Chainlink WS is geo-restricted from this server
    */
   private cgInterval: ReturnType<typeof setInterval> | null = null;
 
   startCoinGeckoPolling() {
     console.log("[price] Starting CoinGecko cross-check (every 30s)...");
-    this.connected.chainlink = true; // repurpose as "cross-check active"
+    this.connected.chainlink = true;
 
     const poll = async () => {
       try {
@@ -138,7 +184,7 @@ export class PriceEngine extends EventEmitter {
         const data = (await res.json()) as any;
         const price = data?.bitcoin?.usd;
         if (price && price > 0) {
-          this.lastChainlinkPrice = price; // use CoinGecko as cross-check price
+          this.lastChainlinkPrice = price;
           this.emit("tick", { source: "coingecko", price, time: Date.now() });
         }
       } catch (e) {
@@ -155,7 +201,6 @@ export class PriceEngine extends EventEmitter {
   }
 
   getAllCloses(): number[] {
-    // Include the current incomplete candle
     return this.candles.map((c) => c.close);
   }
 
@@ -169,8 +214,8 @@ export class PriceEngine extends EventEmitter {
   }
 
   stop() {
-    this.binanceWs?.close();
-    this.binanceWs = null;
+    this.bybitWs?.close();
+    this.bybitWs = null;
     if (this.cgInterval) clearInterval(this.cgInterval);
   }
 }

@@ -312,6 +312,14 @@ let checking = false;
 async function onTick(price: number) {
   if (state.paused || checking) return;
   tickCount++;
+  
+  // Log tick count every 60 ticks (~1 per sec from Bybit)
+  if (tickCount % 60 === 1) {
+    const now = Math.floor(Date.now() / 1000);
+    const cws = Math.floor(now / 300) * 300;
+    const tiw = now - cws;
+    console.log(`[tick] #${tickCount} price=$${price.toFixed(2)} window=${tiw}s`);
+  }
 
   // Always try to settle pending trades, regardless of price movement
   const hasPending = state.trades.some(t => t.result === "pending");
