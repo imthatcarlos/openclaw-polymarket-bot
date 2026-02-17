@@ -303,11 +303,10 @@ async function onTick(price) {
     // Cooldown after trade completes (win or loss)
     if (Date.now() - lastTradeTime < state.config.cooldownMs)
         return;
-    // Sweet spot window: 90-150s
-    // Too early (<90s): BTC hasn't committed, signal unreliable
-    // Sweet spot (90-150s): Move confirmed, MMs haven't fully repriced (especially overnight)
-    // Too late (>150s): MMs caught up, orderbook already reflects the move
-    if (timeInWindow < 90 || timeInWindow > 150)
+    // Early entry window: 30-120s
+    // Skip first 30s (stale open price), enter before MMs fully reprice
+    // This matched our winning sessions (UTC 03-05, 23)
+    if (timeInWindow < 30 || timeInWindow > 120)
         return;
     // Overnight filter: only trade UTC 22-06 when MM repricing is slower
     const hourUTC = new Date().getUTCHours();
