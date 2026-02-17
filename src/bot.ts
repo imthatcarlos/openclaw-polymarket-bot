@@ -1,13 +1,16 @@
 /**
- * Polymarket BTC 5-Min Trading Bot v7 — "Panic Catcher"
+ * Polymarket BTC 5-Min Trading Bot v8 — "Last Look"
  * 
- * Strategy: Place cheap limit orders on BOTH sides at window open.
- * When BTC moves hard, panic sellers dump the losing side to pennies.
- * Our standing limit order fills at $0.05-0.08. If it wins → 12-19x return.
- * If it loses → we risked $0.05-0.08 per token. Asymmetric payoff.
+ * Strategy: Trade in the LAST 60 seconds of each 5-min window when the
+ * outcome is nearly certain. At 240s+, if BTC has moved significantly from
+ * the window open price, the settlement direction is almost locked in.
  * 
- * No directional prediction needed. No latency race with MMs.
- * We ARE the liquidity that panic sellers hit.
+ * We use Bybit real-time price as primary signal and the on-chain Chainlink
+ * push feed (Polygon) as secondary confirmation. Both track the same
+ * underlying exchanges that Chainlink Data Streams uses for settlement.
+ * 
+ * Even buying at $0.80-0.85 is profitable when you KNOW the outcome.
+ * The edge isn't speed — it's timing. We wait until uncertainty is gone.
  */
 
 import express from "express";
@@ -26,64 +29,61 @@ const BOT_PORT = parseInt(process.env.BOT_PORT || "3847");
 const USDC_ADDRESS = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174";
 const CTF_ADDRESS = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045";
 const WALLET_ADDRESS = process.env.WALLET_ADDRESS || "0x1a1E1b82Da7E91E9567a40b0f952748b586389F9";
+const CHAINLINK_BTC_USD_POLYGON = "0xc907E116054Ad103354f2D350FD2514433D57F6f";
 
-// ── Panic Catcher Config ────────────────────────────────────
-interface PanicConfig {
-  // Limit order prices for each side
-  bidPrice: number;         // Price to bid on cheap side (default $0.06)
-  maxBidPrice: number;      // Never bid above this (default $0.10)
+// ── Last Look Config ────────────────────────────────────────
+interface LastLookConfig {
+  // Timing: only trade in the last N seconds of window
+  entryWindowStart: number;    // Earliest entry (default 240 = last 60s)
+  entryWindowEnd: number;      // Latest entry (default 290 = stop 10s before close)
+  
+  // Signal thresholds
+  minDeltaAbsolute: number;    // Min BTC move in $ (default $50)
+  minDeltaPercent: number;     // Min BTC move in % (default 0.07%)
+  
+  // Pricing
+  maxEntryPrice: number;       // Max price to pay for winning side (default $0.88)
   
   // Position sizing
-  sizePerSide: number;      // USD to commit per side per window (default $15)
-  maxTotalExposure: number; // Max total in open orders across windows (default $100)
+  positionSize: number;        // Base size floor (default $50)
+  maxPositionSize: number;     // Cap (default $500)
+  compoundFraction: number;    // % of wallet per trade (default 0.20 = 20%)
   
-  // Timing
-  placeAtSecond: number;    // Seconds into window to place orders (default 5)
-  cancelAtSecond: number;   // Cancel unfilled orders at this time (default 270 = 30s before close)
+  // Confirmation
+  requireChainlinkConfirm: boolean;  // Require on-chain CL feed to agree (default true)
+  maxChainlinkAge: number;           // Max age of CL price in seconds (default 60)
   
-  // Filters
-  minSpread: number;        // Only place if spread > this (bid/ask gap, default $0.03)
-  
-  // Operational
+  // Safety
+  cooldownMs: number;          // Min time between trades (default 30000)
+  pnlFloor: number;            // Auto-pause at this P&L (default -$100)
   dryRun: boolean;
-  pnlFloor: number;         // Auto-pause at this session P&L (default -$50)
 }
 
-const DEFAULT_PANIC_CONFIG: PanicConfig = {
-  bidPrice: 0.06,
-  maxBidPrice: 0.10,
-  sizePerSide: 15,
-  maxTotalExposure: 100,
-  placeAtSecond: 5,
-  cancelAtSecond: 270,
-  minSpread: 0.03,
-  dryRun: true,  // Start in dry run!
-  pnlFloor: -50,
+const DEFAULT_CONFIG: LastLookConfig = {
+  entryWindowStart: 240,
+  entryWindowEnd: 290,
+  minDeltaAbsolute: 50,
+  minDeltaPercent: 0.07,
+  maxEntryPrice: 0.88,
+  positionSize: 50,
+  maxPositionSize: 500,
+  compoundFraction: 0.20,
+  requireChainlinkConfirm: true,
+  maxChainlinkAge: 60,
+  cooldownMs: 30000,
+  pnlFloor: -100,
+  dryRun: true,
 };
 
 // ── Types ───────────────────────────────────────────────────
-interface PanicOrder {
-  windowStart: number;
-  direction: "UP" | "DOWN";
-  tokenId: string;
-  orderId: string | null;
-  bidPrice: number;
-  size: number;         // token count
-  cost: number;         // USD committed
-  status: "placed" | "filled" | "canceled" | "expired";
-  fillSize: number;     // tokens actually matched
-  fillCost: number;     // USD actually spent
-  placedAt: number;     // timestamp
-}
-
 interface Trade {
   timestamp: number;
   market: string;
   windowStart: number;
   direction: "UP" | "DOWN";
-  price: number;        // entry price per token
-  size: number;         // tokens filled
-  cost: number;         // total USD spent
+  price: number;
+  size: number;
+  cost: number;
   result: "win" | "loss" | "pending" | "dry-run";
   pnl: number;
   orderId?: string;
@@ -92,11 +92,17 @@ interface Trade {
   walletAfter?: number;
   btcAtEntry: number;
   btcWindowOpen: number;
+  deltaAtEntry: number;
+  timeInWindow: number;
+  chainlinkPrice: number;
+  chainlinkAge: number;
+  bestAskAtEntry: number;
   hourUTC: number;
+  reasons: string[];
 }
 
 interface BotState {
-  config: PanicConfig;
+  config: LastLookConfig;
   trades: Trade[];
   totalPnL: number;
   wins: number;
@@ -104,8 +110,6 @@ interface BotState {
   skips: number;
   paused: boolean;
   sessionStartBalance?: number;
-  // Track active orders per window
-  activeOrders: PanicOrder[];
 }
 
 // ── Wallet Helpers ──────────────────────────────────────────
@@ -158,13 +162,46 @@ async function redeemPosition(conditionId: string): Promise<boolean> {
   }
 }
 
+// ── Chainlink On-Chain Price Feed ───────────────────────────
+let chainlinkFeed: ethers.Contract | null = null;
+let lastChainlinkPrice = 0;
+let lastChainlinkTimestamp = 0;
+let lastChainlinkFetchTime = 0;
+
+async function getChainlinkPrice(): Promise<{ price: number; age: number }> {
+  // Cache for 5s to avoid hammering RPC
+  if (Date.now() - lastChainlinkFetchTime < 5000 && lastChainlinkPrice > 0) {
+    return { price: lastChainlinkPrice, age: Math.floor(Date.now() / 1000) - lastChainlinkTimestamp };
+  }
+  
+  try {
+    if (!chainlinkFeed) {
+      const p = getProvider();
+      chainlinkFeed = new ethers.Contract(CHAINLINK_BTC_USD_POLYGON, [
+        "function latestRoundData() view returns (uint80, int256, uint256, uint256, uint80)",
+        "function decimals() view returns (uint8)"
+      ], p);
+    }
+    const [, price, , updatedAt] = await chainlinkFeed.latestRoundData();
+    const dec = await chainlinkFeed.decimals();
+    lastChainlinkPrice = parseFloat(ethers.utils.formatUnits(price, dec));
+    lastChainlinkTimestamp = updatedAt.toNumber();
+    lastChainlinkFetchTime = Date.now();
+    const age = Math.floor(Date.now() / 1000) - lastChainlinkTimestamp;
+    return { price: lastChainlinkPrice, age };
+  } catch (e: any) {
+    console.error("[chainlink] Feed error:", e.message);
+    return { price: lastChainlinkPrice, age: 999 };
+  }
+}
+
 // ── State ───────────────────────────────────────────────────
 function loadState(): BotState {
   if (existsSync(STATE_FILE)) {
     try {
       const s = JSON.parse(readFileSync(STATE_FILE, "utf-8"));
       return {
-        config: { ...DEFAULT_PANIC_CONFIG, ...s.config },
+        config: { ...DEFAULT_CONFIG, ...s.config },
         trades: s.trades ?? [],
         totalPnL: s.totalPnL ?? 0,
         wins: s.wins ?? 0,
@@ -172,11 +209,10 @@ function loadState(): BotState {
         skips: s.skips ?? 0,
         paused: s.paused ?? false,
         sessionStartBalance: s.sessionStartBalance ?? undefined,
-        activeOrders: s.activeOrders ?? [],
       };
     } catch {}
   }
-  return { config: { ...DEFAULT_PANIC_CONFIG }, trades: [], totalPnL: 0, wins: 0, losses: 0, skips: 0, paused: false, activeOrders: [] };
+  return { config: { ...DEFAULT_CONFIG }, trades: [], totalPnL: 0, wins: 0, losses: 0, skips: 0, paused: false };
 }
 
 function saveState() {
@@ -190,7 +226,6 @@ function saveState() {
       skips: state.skips,
       paused: state.paused,
       sessionStartBalance: state.sessionStartBalance,
-      activeOrders: state.activeOrders,
     }, null, 2));
   } catch {}
 }
@@ -200,7 +235,16 @@ const priceEngine = new PriceEngine();
 let clobClient: any = null;
 let startedAt = Date.now();
 let tickCount = 0;
-let lastWindowPlaced = 0;  // Track which window we've placed orders for
+let checkCount = 0;
+let lastTradeTime = 0;
+let windowOpenPrices: Map<number, number> = new Map();
+let tradedWindows: Set<number> = new Set();
+let lastSignalLog = "";
+
+// Populate tradedWindows from existing trades
+for (const t of state.trades) {
+  if (t.windowStart) tradedWindows.add(t.windowStart);
+}
 
 // ── CLOB Client ─────────────────────────────────────────────
 async function initClobClient() {
@@ -224,199 +268,6 @@ async function initClobClient() {
   }
 }
 
-// ── Place Orders on Both Sides ──────────────────────────────
-async function placeOrders(market: MarketInfo, btcPrice: number) {
-  const cfg = state.config;
-  const windowStart = market.windowStart;
-  
-  // Calculate total current exposure
-  const currentExposure = state.activeOrders
-    .filter(o => o.status === "placed" || o.status === "filled")
-    .reduce((sum, o) => sum + o.cost, 0);
-  
-  if (currentExposure + cfg.sizePerSide * 2 > cfg.maxTotalExposure) {
-    console.log(`[panic] Skip: exposure $${currentExposure.toFixed(2)} + $${(cfg.sizePerSide * 2).toFixed(2)} > max $${cfg.maxTotalExposure}`);
-    state.skips++;
-    return;
-  }
-
-  // Check wallet
-  const wallet = await getWalletBalance();
-  if (wallet >= 0 && wallet < cfg.sizePerSide * 2 + 5) {
-    console.log(`[panic] Skip: wallet $${wallet.toFixed(2)} too low for $${(cfg.sizePerSide * 2).toFixed(2)} orders`);
-    return;
-  }
-
-  const bidPrice = cfg.bidPrice;
-  const tokensPerSide = Math.floor(cfg.sizePerSide / bidPrice);
-  const costPerSide = tokensPerSide * bidPrice;
-
-  console.log(`\n[panic] 🎯 Window ${windowStart} | Placing BOTH sides @ $${bidPrice}`);
-  console.log(`  → UP: ${tokensPerSide} tokens × $${bidPrice} = $${costPerSide.toFixed(2)}`);
-  console.log(`  → DOWN: ${tokensPerSide} tokens × $${bidPrice} = $${costPerSide.toFixed(2)}`);
-  console.log(`  → Total risk: $${(costPerSide * 2).toFixed(2)} | Max win: $${(tokensPerSide - costPerSide).toFixed(2)} per side`);
-  console.log(`  → BTC: $${btcPrice.toFixed(0)} | Book: UP bid=$${market.upBestBid} ask=$${market.upBestAsk} | DOWN bid=$${market.downBestBid} ask=$${market.downBestAsk}`);
-
-  // Place UP limit order
-  const upOrder = await placeSingleOrder(market, "UP", market.upTokenId, bidPrice, tokensPerSide, costPerSide, btcPrice);
-  if (upOrder) state.activeOrders.push(upOrder);
-
-  // Place DOWN limit order
-  const downOrder = await placeSingleOrder(market, "DOWN", market.downTokenId, bidPrice, tokensPerSide, costPerSide, btcPrice);
-  if (downOrder) state.activeOrders.push(downOrder);
-
-  lastWindowPlaced = windowStart;
-  saveState();
-}
-
-async function placeSingleOrder(
-  market: MarketInfo,
-  direction: "UP" | "DOWN",
-  tokenId: string,
-  bidPrice: number,
-  size: number,
-  cost: number,
-  btcPrice: number
-): Promise<PanicOrder | null> {
-  const order: PanicOrder = {
-    windowStart: market.windowStart,
-    direction,
-    tokenId,
-    orderId: null,
-    bidPrice,
-    size,
-    cost,
-    status: "placed",
-    fillSize: 0,
-    fillCost: 0,
-    placedAt: Date.now(),
-  };
-
-  if (state.config.dryRun) {
-    order.orderId = `dry-${direction}-${market.windowStart}`;
-    console.log(`[panic] 🏜️ DRY RUN: ${direction} ${size} tokens @ $${bidPrice}`);
-    return order;
-  }
-
-  if (!clobClient) {
-    console.log(`[panic] ❌ No CLOB client`);
-    return null;
-  }
-
-  try {
-    const clobOrder = await clobClient.createOrder({
-      tokenID: tokenId,
-      price: bidPrice,
-      side: "BUY" as any,
-      size: size,
-    });
-    const result = await clobClient.postOrder(clobOrder);
-    const orderId = result?.orderID || result?.id || null;
-
-    if (!orderId || orderId === "unknown") {
-      const errMsg = result?.error || result?.data?.error || "unknown";
-      console.error(`[panic] ❌ ${direction} order failed: ${errMsg}`);
-      return null;
-    }
-
-    order.orderId = orderId;
-    console.log(`[panic] ✅ ${direction} order placed: ${orderId}`);
-    return order;
-  } catch (e: any) {
-    const errData = e?.response?.data?.error || e.message;
-    console.error(`[panic] ❌ ${direction} order error: ${errData}`);
-    return null;
-  }
-}
-
-// ── Check Fills on Active Orders ────────────────────────────
-async function checkFills() {
-  if (!clobClient) return;
-  
-  for (const order of state.activeOrders) {
-    if (order.status !== "placed" || !order.orderId || order.orderId.startsWith("dry-")) continue;
-
-    try {
-      const orderStatus = await clobClient.getOrder(order.orderId);
-      const matched = parseInt(orderStatus?.size_matched || "0");
-      
-      if (matched > 0 && order.fillSize === 0) {
-        // Newly filled!
-        order.fillSize = matched;
-        order.fillCost = matched * order.bidPrice;
-        order.status = "filled";
-        
-        console.log(`[panic] 🔥 FILL: ${order.direction} ${matched} tokens @ $${order.bidPrice} = $${order.fillCost.toFixed(2)} (window ${order.windowStart})`);
-
-        // Get wallet balance before potential settlement
-        const walBefore = await getWalletBalance();
-
-        // Record as trade
-        const trade: Trade = {
-          timestamp: Date.now(),
-          market: `btc-updown-5m-${order.windowStart}`,
-          windowStart: order.windowStart,
-          direction: order.direction,
-          price: order.bidPrice,
-          size: matched,
-          cost: order.fillCost,
-          result: "pending",
-          pnl: 0,
-          orderId: order.orderId,
-          walletBefore: walBefore,
-          btcAtEntry: priceEngine.lastBinancePrice,
-          btcWindowOpen: priceEngine.lastBinancePrice, // approximate
-          hourUTC: new Date().getUTCHours(),
-        };
-        state.trades.push(trade);
-        if (state.trades.length > 200) state.trades.shift();
-        saveState();
-        
-        // Cancel the OTHER side's order for this window (we have a fill, reduce exposure)
-        const otherSide = state.activeOrders.find(
-          o => o.windowStart === order.windowStart && o.direction !== order.direction && o.status === "placed"
-        );
-        if (otherSide && otherSide.orderId && !otherSide.orderId.startsWith("dry-")) {
-          try {
-            await clobClient.cancelOrder({ orderID: otherSide.orderId });
-            otherSide.status = "canceled";
-            console.log(`[panic] Canceled ${otherSide.direction} order (other side filled)`);
-          } catch {}
-        }
-      }
-    } catch (e: any) {
-      // Ignore individual order check failures
-    }
-  }
-}
-
-// ── Cancel Expired Orders ───────────────────────────────────
-async function cancelExpiredOrders() {
-  const now = Math.floor(Date.now() / 1000);
-  
-  for (const order of state.activeOrders) {
-    if (order.status !== "placed") continue;
-    
-    const timeInWindow = now - order.windowStart;
-    
-    // Cancel if past cancel time or window has ended
-    if (timeInWindow >= state.config.cancelAtSecond || timeInWindow >= 300) {
-      if (order.orderId && !order.orderId.startsWith("dry-") && clobClient) {
-        try {
-          await clobClient.cancelOrder({ orderID: order.orderId });
-          console.log(`[panic] Canceled unfilled ${order.direction} order (window ${order.windowStart}, ${timeInWindow}s in)`);
-        } catch {}
-      }
-      order.status = "expired";
-    }
-  }
-  
-  // Cleanup old orders (keep last 100)
-  if (state.activeOrders.length > 100) {
-    state.activeOrders = state.activeOrders.slice(-100);
-  }
-}
-
 // ── Settlement ──────────────────────────────────────────────
 async function settleTrades() {
   const pending = state.trades.filter(t => t.result === "pending");
@@ -429,60 +280,53 @@ async function settleTrades() {
     const won = (trade.direction === "UP" && winner === "Up") ||
                 (trade.direction === "DOWN" && winner === "Down");
 
-    // Find conditionId from active orders
-    const relatedOrder = state.activeOrders.find(
-      o => o.windowStart === trade.windowStart && o.direction === trade.direction
-    );
-
     if (won) {
       trade.result = "win";
       state.wins++;
 
-      // Find conditionId from market
-      try {
-        const market = await findMarketByWindow(trade.windowStart);
-        if (market?.conditionId) {
-          console.log(`[settle] Redeeming winning position...`);
-          await redeemPosition(market.conditionId);
-        }
-      } catch {}
+      if (trade.conditionId) {
+        console.log(`[settle] Redeeming winning position...`);
+        await redeemPosition(trade.conditionId);
+      }
 
       const balAfter = await getWalletBalance();
       trade.walletAfter = balAfter;
       if (trade.walletBefore != null && trade.walletBefore >= 0 && balAfter >= 0) {
         trade.pnl = balAfter - trade.walletBefore;
       } else {
-        // Approximate: won tokens * $1 - cost
         trade.pnl = trade.size * 1.0 - trade.cost;
       }
-      console.log(`[settle] ✅ WIN ${trade.direction} | Bought ${trade.size} @ $${trade.price} ($${trade.cost.toFixed(2)}) → $${trade.size.toFixed(2)} payout | P&L: +$${trade.pnl.toFixed(2)}`);
+      console.log(`[settle] ✅ WIN ${trade.direction} | Bought ${trade.size} @ $${trade.price.toFixed(2)} | P&L: +$${trade.pnl.toFixed(2)} | ${state.wins}W/${state.losses}L`);
     } else {
       trade.result = "loss";
       state.losses++;
-      
+
       const balAfter = await getWalletBalance();
       trade.walletAfter = balAfter;
-      trade.pnl = -trade.cost;  // Tokens worthless
-      
-      console.log(`[settle] ❌ LOSS ${trade.direction} | Lost $${trade.cost.toFixed(2)} (${trade.size} tokens @ $${trade.price})`);
+      if (trade.walletBefore != null && trade.walletBefore >= 0 && balAfter >= 0) {
+        trade.pnl = balAfter - trade.walletBefore;
+      } else {
+        trade.pnl = -trade.cost;
+      }
+      console.log(`[settle] ❌ LOSS ${trade.direction} | Cost: $${trade.cost.toFixed(2)} | P&L: $${trade.pnl.toFixed(2)} | ${state.wins}W/${state.losses}L`);
 
-      // Post-mortem
       try {
         appendFileSync(PM_FILE, JSON.stringify({
           timestamp: new Date().toISOString(),
-          strategy: "panic-catcher",
+          strategy: "last-look-v8",
           direction: trade.direction,
           cost: trade.cost,
           price: trade.price,
-          size: trade.size,
-          windowStart: trade.windowStart,
-          hourUTC: trade.hourUTC,
+          btcDelta: trade.deltaAtEntry,
+          timeInWindow: trade.timeInWindow,
+          chainlinkPrice: trade.chainlinkPrice,
+          bestAsk: trade.bestAskAtEntry,
+          reasons: trade.reasons,
         }) + "\n");
       } catch {}
     }
 
     state.totalPnL += trade.pnl;
-    saveState();
 
     const currentBal = trade.walletAfter ?? await getWalletBalance();
     if (state.sessionStartBalance != null && currentBal >= 0) {
@@ -490,10 +334,11 @@ async function settleTrades() {
       console.log(`[settle] Session P&L: $${sessionPnL.toFixed(2)} (wallet: $${currentBal.toFixed(2)})`);
     }
 
+    saveState();
+
     // Circuit breaker
-    const floor = state.config.pnlFloor;
-    if (state.totalPnL <= floor) {
-      console.log(`[circuit-breaker] 🛑 P&L $${state.totalPnL.toFixed(2)} hit floor $${floor}. Auto-pausing.`);
+    if (state.totalPnL <= state.config.pnlFloor) {
+      console.log(`[circuit-breaker] 🛑 P&L $${state.totalPnL.toFixed(2)} hit floor $${state.config.pnlFloor}. Auto-pausing.`);
       state.paused = true;
       saveState();
       return;
@@ -501,200 +346,308 @@ async function settleTrades() {
   }
 }
 
-async function findMarketByWindow(windowStart: number): Promise<MarketInfo | null> {
-  // Temporarily override time-based check in findCurrentMarket by fetching directly
-  const slug = `btc-updown-5m-${windowStart}`;
-  try {
-    const PROXY_SECRET = process.env.PROXY_SECRET || "";
-    const res = await fetch(PROXY_URL, {
-      headers: { "x-target-url": `https://gamma-api.polymarket.com/events/slug/${slug}`, "x-proxy-secret": PROXY_SECRET },
-    });
-    if (!res.ok) return null;
-    const event = await res.json() as any;
-    const market = event?.markets?.[0];
-    if (!market) return null;
-    return { conditionId: market.conditionId } as MarketInfo;
-  } catch { return null; }
-}
+// ── Core Tick Handler ───────────────────────────────────────
+let checking = false;
 
-// ── Dry Run Simulation ──────────────────────────────────────
-// In dry run, simulate fills when price moves enough to make one side cheap
-function simulateDryRunFills(btcPrice: number) {
+async function onTick(price: number) {
+  if (state.paused || checking) return;
+  tickCount++;
+
   const now = Math.floor(Date.now() / 1000);
-  
-  for (const order of state.activeOrders) {
-    if (order.status !== "placed" || !order.orderId?.startsWith("dry-")) continue;
+  const currentWindowStart = Math.floor(now / 300) * 300;
+  const timeInWindow = now - currentWindowStart;
+
+  // Track window open price
+  if (!windowOpenPrices.has(currentWindowStart)) {
+    windowOpenPrices.set(currentWindowStart, price);
+    for (const [k] of windowOpenPrices) {
+      if (k < currentWindowStart - 3600) windowOpenPrices.delete(k);
+    }
+  }
+
+  // Periodic tick log
+  if (tickCount % 120 === 1) {
+    const pending = state.trades.filter(t => t.result === "pending").length;
+    console.log(`[tick] #${tickCount} price=$${price.toFixed(2)} window=${timeInWindow}s | pending=${pending}`);
+  }
+
+  // ── TIMING GATE: Only trade in last 60 seconds ──
+  if (timeInWindow < state.config.entryWindowStart || timeInWindow > state.config.entryWindowEnd) return;
+
+  // Already traded this window
+  if (tradedWindows.has(currentWindowStart)) return;
+
+  // Cooldown
+  if (Date.now() - lastTradeTime < state.config.cooldownMs) return;
+
+  const windowOpenPrice = windowOpenPrices.get(currentWindowStart);
+  if (!windowOpenPrice) return;
+
+  // Quick delta pre-check
+  const delta = price - windowOpenPrice;
+  const absDelta = Math.abs(delta);
+  const deltaPct = (absDelta / windowOpenPrice) * 100;
+  if (absDelta < state.config.minDeltaAbsolute || deltaPct < state.config.minDeltaPercent) return;
+
+  // We have a signal candidate — do the full check
+  checking = true;
+  checkCount++;
+
+  try {
+    // Settle old trades first
+    await settleTrades();
+
+    const direction: "UP" | "DOWN" = delta > 0 ? "UP" : "DOWN";
+    const reasons: string[] = [];
+
+    reasons.push(`BTC: $${price.toFixed(0)} | Open: $${windowOpenPrice.toFixed(0)} | Δ: ${delta > 0 ? "+" : ""}$${delta.toFixed(0)} (${(delta/windowOpenPrice*100).toFixed(3)}%) | ${timeInWindow}s into window`);
+
+    // ── Chainlink confirmation ──
+    const cl = await getChainlinkPrice();
+    const clDelta = cl.price - windowOpenPrice;
+    const clAgrees = (direction === "UP" && clDelta > 0) || (direction === "DOWN" && clDelta < 0);
     
-    const windowStart = order.windowStart;
-    const timeInWindow = now - windowStart;
-    
-    // Need a window open price to calculate delta
-    const windowOpen = priceEngine.windowOpenPrices?.get(windowStart);
-    if (!windowOpen) continue;
-    
-    const delta = btcPrice - windowOpen;
-    const deltaPct = Math.abs(delta / windowOpen) * 100;
-    
-    // Simulate: if BTC moved >0.15% (~$100), the losing side's asks crash to our bid level
-    // UP crashes when BTC drops, DOWN crashes when BTC rises
-    // At 0.15%, real orderbook shows losing side asks dropping to $0.10-0.20 range
-    // Our $0.06 limit would realistically fill at ~0.20%+ moves
-    const wouldFill = (order.direction === "UP" && delta < 0 && deltaPct > 0.15) ||
-                      (order.direction === "DOWN" && delta > 0 && deltaPct > 0.15);
-    
-    if (wouldFill && timeInWindow >= 30 && timeInWindow <= 270) {
-      order.status = "filled";
-      order.fillSize = order.size;
-      order.fillCost = order.cost;
-      
-      console.log(`[dry-run] 🔥 SIMULATED FILL: ${order.direction} ${order.size} tokens @ $${order.bidPrice} (BTC Δ: ${delta > 0 ? '+' : ''}$${delta.toFixed(0)}, ${deltaPct.toFixed(2)}%)`);
-      
-      // Record trade
-      const trade: Trade = {
-        timestamp: Date.now(),
-        market: `btc-updown-5m-${windowStart}`,
-        windowStart,
-        direction: order.direction,
-        price: order.bidPrice,
-        size: order.size,
-        cost: order.cost,
-        result: "dry-run",
-        pnl: 0,
-        orderId: order.orderId,
-        btcAtEntry: btcPrice,
-        btcWindowOpen: windowOpen,
-        hourUTC: new Date().getUTCHours(),
-      };
-      
-      // In dry run, calculate hypothetical outcome
-      // The fill is on the LOSING side (panic). Does it reverse?
-      // We'll check at settlement. For now mark as dry-run.
-      state.trades.push(trade);
-      if (state.trades.length > 200) state.trades.shift();
-      
-      // Cancel other side
-      const otherSide = state.activeOrders.find(
-        o => o.windowStart === windowStart && o.direction !== order.direction && o.status === "placed"
-      );
-      if (otherSide) {
-        otherSide.status = "canceled";
-        console.log(`[dry-run] Canceled ${otherSide.direction} (other side filled)`);
+    reasons.push(`Chainlink: $${cl.price.toFixed(2)} (${cl.age}s old) | Δ: ${clDelta > 0 ? "+" : ""}$${clDelta.toFixed(0)} | ${clAgrees ? "✅ AGREES" : "⚠️ DISAGREES"}`);
+
+    if (state.config.requireChainlinkConfirm) {
+      if (cl.age > state.config.maxChainlinkAge) {
+        reasons.push(`SKIP: Chainlink too stale (${cl.age}s > ${state.config.maxChainlinkAge}s)`);
+        logSignal(reasons);
+        checking = false;
+        return;
+      }
+      if (!clAgrees) {
+        reasons.push(`SKIP: Chainlink disagrees with Bybit direction`);
+        logSignal(reasons);
+        state.skips++;
+        checking = false;
+        return;
       }
     }
+
+    // ── Get market + orderbook ──
+    const market = await findCurrentMarket();
+    if (!market) {
+      reasons.push("SKIP: Market not found");
+      logSignal(reasons);
+      checking = false;
+      return;
+    }
+
+    priceEngine.subscribeMarket(market.upTokenId, market.downTokenId);
+
+    // Update with live book data
+    const pb = priceEngine.polyBook;
+    const bookAge = Date.now() - pb.lastUpdate;
+    if (pb.lastUpdate > 0 && bookAge < 10000) {
+      market.upBestAsk = pb.upBestAsk;
+      market.downBestAsk = pb.downBestAsk;
+      market.upBestBid = pb.upBestBid;
+      market.downBestBid = pb.downBestBid;
+      market.upAskDepth = pb.upAskDepth;
+      market.downAskDepth = pb.downAskDepth;
+    }
+
+    const bestAsk = direction === "UP" ? market.upBestAsk : market.downBestAsk;
+    const askDepth = direction === "UP" ? market.upAskDepth : market.downAskDepth;
+
+    reasons.push(`Book: UP bid=$${market.upBestBid.toFixed(2)} ask=$${market.upBestAsk.toFixed(2)} | DOWN bid=$${market.downBestBid.toFixed(2)} ask=$${market.downBestAsk.toFixed(2)}`);
+
+    // ── Price check: is entry price acceptable? ──
+    let bidPrice: number;
+    if (bestAsk > 0 && bestAsk <= state.config.maxEntryPrice) {
+      bidPrice = bestAsk;
+      const expectedProfit = (1.0 - bidPrice) * 100;  // cents per token
+      reasons.push(`Entry: $${bidPrice.toFixed(2)} (ask, ${askDepth.toFixed(0)} depth) | Expected profit: ${expectedProfit.toFixed(0)}¢/token`);
+    } else if (bestAsk > state.config.maxEntryPrice) {
+      reasons.push(`SKIP: Ask $${bestAsk.toFixed(2)} > max $${state.config.maxEntryPrice} — too expensive`);
+      logSignal(reasons);
+      state.skips++;
+      checking = false;
+      return;
+    } else {
+      // No ask data — use mid + conservative offset
+      const midPrice = direction === "UP" ? market.upPrice : market.downPrice;
+      bidPrice = Math.min(midPrice + 0.05, state.config.maxEntryPrice);
+      reasons.push(`Entry: $${bidPrice.toFixed(2)} (fallback, no ask data) | Mid: $${midPrice.toFixed(2)}`);
+    }
+
+    // ── Confidence check: is profit margin worth the risk? ──
+    const profitPerToken = 1.0 - bidPrice;
+    if (profitPerToken < 0.10) {
+      reasons.push(`SKIP: Profit margin too thin (${(profitPerToken * 100).toFixed(0)}¢ < 10¢)`);
+      logSignal(reasons);
+      state.skips++;
+      checking = false;
+      return;
+    }
+
+    // ── Position sizing ──
+    let walletBalance = await getWalletBalance();
+    if (walletBalance < 0) walletBalance = 500;
+
+    const tradeSize = Math.min(
+      Math.max(walletBalance * state.config.compoundFraction, state.config.positionSize),
+      state.config.maxPositionSize
+    );
+    const size = Math.floor(tradeSize / bidPrice);
+    if (size < 1) { checking = false; return; }
+    const cost = size * bidPrice;
+
+    reasons.push(`Size: ${size} tokens × $${bidPrice.toFixed(2)} = $${cost.toFixed(2)} (${(state.config.compoundFraction * 100).toFixed(0)}% of $${walletBalance.toFixed(0)})`);
+    reasons.push(`🎯 LAST LOOK: ${direction} | ${timeInWindow}s in | Δ$${absDelta.toFixed(0)} | CL confirms | Profit margin: ${(profitPerToken * 100).toFixed(0)}¢/token`);
+
+    console.log(`\n[bot] 🎯 ${direction} | ${size} tokens @ $${bidPrice.toFixed(2)} = $${cost.toFixed(2)} | ${timeInWindow}s into window (${300 - timeInWindow}s left)`);
+    reasons.forEach(r => console.log(`  → ${r}`));
+
+    // ── Execute ──
+    const trade: Trade = {
+      timestamp: Date.now(),
+      market: market.slug,
+      windowStart: currentWindowStart,
+      direction,
+      price: bidPrice,
+      size,
+      cost,
+      result: state.config.dryRun ? "dry-run" : "pending",
+      pnl: 0,
+      conditionId: market.conditionId,
+      btcAtEntry: price,
+      btcWindowOpen: windowOpenPrice,
+      deltaAtEntry: delta,
+      timeInWindow,
+      chainlinkPrice: cl.price,
+      chainlinkAge: cl.age,
+      bestAskAtEntry: bestAsk,
+      hourUTC: new Date().getUTCHours(),
+      reasons,
+    };
+
+    if (!state.config.dryRun && clobClient) {
+      const balBefore = await getWalletBalance();
+      trade.walletBefore = balBefore;
+
+      if (balBefore >= 0 && balBefore < cost) {
+        const availableCost = Math.floor((balBefore - 1) * 100) / 100;
+        if (availableCost < 5) {
+          console.log(`[bot] ❌ Wallet too low: $${balBefore.toFixed(2)}`);
+          checking = false;
+          return;
+        }
+        trade.size = Math.floor(availableCost / bidPrice);
+        trade.cost = trade.size * bidPrice;
+        console.log(`[bot] ⚠️ Sized down: $${cost.toFixed(2)} → $${trade.cost.toFixed(2)} (wallet: $${balBefore.toFixed(2)})`);
+      }
+
+      const tokenId = direction === "UP" ? market.upTokenId : market.downTokenId;
+
+      try {
+        const order = await clobClient.createOrder({
+          tokenID: tokenId,
+          price: bidPrice,
+          side: "BUY" as any,
+          size: trade.size,
+        });
+        const result = await clobClient.postOrder(order);
+        const orderId = result?.orderID || result?.id || null;
+
+        if (!orderId || orderId === "unknown") {
+          console.error(`[bot] ❌ Order not placed: ${result?.error || "unknown"}`);
+          checking = false;
+          return;
+        }
+
+        trade.orderId = orderId;
+        console.log(`[bot] 📋 Order: ${orderId}`);
+
+        // Wait for fill (we're crossing the spread, should fill fast)
+        await new Promise(r => setTimeout(r, 3000));
+
+        try {
+          const orderStatus = await clobClient.getOrder(orderId);
+          const matched = parseInt(orderStatus?.size_matched || "0");
+          const status = orderStatus?.status || "unknown";
+
+          if (matched === 0) {
+            console.error(`[bot] ❌ Not filled (status=${status}). Canceling.`);
+            try { await clobClient.cancelOrder({ orderID: orderId }); } catch {}
+            checking = false;
+            return;
+          }
+
+          trade.size = matched;
+          trade.cost = matched * bidPrice;
+          console.log(`[bot] ✅ Filled: ${matched} tokens (status=${status})`);
+        } catch (e: any) {
+          console.log(`[bot] ⚠️ Can't verify fill (${e.message}), proceeding`);
+        }
+      } catch (e: any) {
+        console.error(`[bot] ❌ Order failed: ${e?.response?.data?.error || e.message}`);
+        checking = false;
+        return;
+      }
+    } else {
+      console.log("[bot] 🏜️ DRY RUN — would have placed order");
+    }
+
+    state.trades.push(trade);
+    if (state.trades.length > 200) state.trades.shift();
+    tradedWindows.add(currentWindowStart);
+    lastTradeTime = Date.now();
+    saveState();
+
+  } catch (e: any) {
+    console.error(`[bot] Error: ${e.message}`);
+  }
+
+  checking = false;
+}
+
+function logSignal(reasons: string[]) {
+  const sig = reasons.join(" | ").slice(0, 120);
+  // Only log if different from last (avoid spam)
+  if (sig !== lastSignalLog) {
+    console.log(`[signal] ${reasons[reasons.length - 1]}`);
+    lastSignalLog = sig;
   }
 }
 
-// Settle dry-run trades
+// ── Dry Run Settlement ──────────────────────────────────────
 async function settleDryRuns() {
-  const dryPending = state.trades.filter(t => t.result === "dry-run" && t.windowStart > 0);
-  for (const trade of dryPending) {
+  const pending = state.trades.filter(t => t.result === "dry-run" && t.windowStart > 0);
+  for (const trade of pending) {
     if (Date.now() / 1000 < trade.windowStart + 360) continue;
-    
+
     const winner = await checkMarketOutcome(trade.windowStart);
     if (!winner || winner === "pending") continue;
-    
+
     const won = (trade.direction === "UP" && winner === "Up") ||
                 (trade.direction === "DOWN" && winner === "Down");
-    
+
     if (won) {
-      trade.pnl = trade.size * 1.0 - trade.cost;  // tokens worth $1 each
+      trade.pnl = trade.size * 1.0 - trade.cost;
       state.wins++;
-      console.log(`[dry-settle] ✅ WIN ${trade.direction} @ $${trade.price} | ${trade.size} tokens | P&L: +$${trade.pnl.toFixed(2)} (${(trade.pnl / trade.cost * 100).toFixed(0)}% return)`);
+      console.log(`[dry-settle] ✅ WIN ${trade.direction} @ $${trade.price.toFixed(2)} | ${trade.size} tokens | +$${trade.pnl.toFixed(2)} (${(trade.pnl / trade.cost * 100).toFixed(0)}% return) | Δ$${trade.deltaAtEntry.toFixed(0)} @ ${trade.timeInWindow}s`);
     } else {
       trade.pnl = -trade.cost;
       state.losses++;
-      console.log(`[dry-settle] ❌ LOSS ${trade.direction} @ $${trade.price} | Lost $${trade.cost.toFixed(2)}`);
+      console.log(`[dry-settle] ❌ LOSS ${trade.direction} @ $${trade.price.toFixed(2)} | -$${trade.cost.toFixed(2)} | Δ$${trade.deltaAtEntry.toFixed(0)} @ ${trade.timeInWindow}s`);
+      try {
+        appendFileSync(PM_FILE, JSON.stringify({
+          timestamp: new Date().toISOString(),
+          strategy: "last-look-v8-dry",
+          direction: trade.direction,
+          delta: trade.deltaAtEntry,
+          timeInWindow: trade.timeInWindow,
+          price: trade.price,
+          chainlinkPrice: trade.chainlinkPrice,
+        }) + "\n");
+      } catch {}
     }
     trade.result = won ? "win" : "loss";
     state.totalPnL += trade.pnl;
     saveState();
   }
-}
-
-// ── Core Tick Handler ───────────────────────────────────────
-let processing = false;
-
-async function onTick(price: number) {
-  if (state.paused || processing) return;
-  tickCount++;
-  
-  const now = Math.floor(Date.now() / 1000);
-  const currentWindowStart = Math.floor(now / 300) * 300;
-  const timeInWindow = now - currentWindowStart;
-  
-  // Track window open prices for dry run simulation
-  if (!priceEngine.windowOpenPrices) priceEngine.windowOpenPrices = new Map();
-  if (!priceEngine.windowOpenPrices.has(currentWindowStart)) {
-    priceEngine.windowOpenPrices.set(currentWindowStart, price);
-    // Cleanup old
-    for (const [k] of priceEngine.windowOpenPrices) {
-      if (k < currentWindowStart - 3600) priceEngine.windowOpenPrices.delete(k);
-    }
-  }
-
-  // Log periodic tick
-  if (tickCount % 120 === 1) {
-    const activeCount = state.activeOrders.filter(o => o.status === "placed").length;
-    const pendingCount = state.trades.filter(t => t.result === "pending" || (t.result === "dry-run" && Date.now() / 1000 < t.windowStart + 360)).length;
-    console.log(`[tick] #${tickCount} price=$${price.toFixed(2)} window=${timeInWindow}s | active_orders=${activeCount} pending_trades=${pendingCount}`);
-  }
-
-  // Dry run fill simulation
-  if (state.config.dryRun) {
-    simulateDryRunFills(price);
-  }
-
-  // Only process order placement/management every few seconds to avoid hammering APIs
-  if (tickCount % 5 !== 0) return;
-
-  processing = true;
-  try {
-    // 1. Settle completed trades
-    if (state.config.dryRun) {
-      await settleDryRuns();
-    } else {
-      await settleTrades();
-    }
-
-    // 2. Check fills on active orders
-    if (!state.config.dryRun) {
-      await checkFills();
-    }
-
-    // 3. Cancel expired orders  
-    await cancelExpiredOrders();
-
-    // 4. Place new orders if it's time
-    if (timeInWindow >= state.config.placeAtSecond && 
-        timeInWindow <= 60 &&  // Only place in first 60s
-        lastWindowPlaced !== currentWindowStart) {
-      
-      const market = await findCurrentMarket();
-      if (market) {
-        // Subscribe to WS for live data
-        priceEngine.subscribeMarket(market.upTokenId, market.downTokenId);
-        
-        // Update market with live book if available
-        const pb = priceEngine.polyBook;
-        const bookAge = Date.now() - pb.lastUpdate;
-        if (pb.lastUpdate > 0 && bookAge < 10000) {
-          market.upBestAsk = pb.upBestAsk;
-          market.downBestAsk = pb.downBestAsk;
-          market.upBestBid = pb.upBestBid;
-          market.downBestBid = pb.downBestBid;
-        }
-        
-        console.log(`[book] UP: bid=$${market.upBestBid.toFixed(2)} ask=$${market.upBestAsk.toFixed(2)} | DOWN: bid=$${market.downBestBid.toFixed(2)} ask=$${market.downBestAsk.toFixed(2)}`);
-        
-        await placeOrders(market, price);
-      } else {
-        state.skips++;
-      }
-    }
-  } catch (e: any) {
-    console.error(`[bot] Error: ${e.message}`);
-  }
-  processing = false;
 }
 
 // ── Settlement loop (backup) ────────────────────────────────
@@ -704,9 +657,7 @@ setInterval(async () => {
       await settleDryRuns();
     } else {
       await settleTrades();
-      await checkFills();
     }
-    await cancelExpiredOrders();
     saveState();
   }
 }, 30_000);
@@ -719,41 +670,33 @@ app.get("/status", async (_req, res) => {
   const nowSec = Math.floor(Date.now() / 1000);
   const cwStart = Math.floor(nowSec / 300) * 300;
   const timeInWindow = nowSec - cwStart;
+  const wop = windowOpenPrices.get(cwStart);
   const wallet = await getWalletBalance();
   const sessionPnL = state.sessionStartBalance != null && wallet >= 0
     ? wallet - state.sessionStartBalance : null;
-
-  const activeOrders = state.activeOrders.filter(o => o.status === "placed");
-  const filledOrders = state.activeOrders.filter(o => o.status === "filled");
+  const cl = await getChainlinkPrice();
 
   res.json({
-    version: "v7-panic-catcher",
+    version: "v8-last-look",
     running: true,
     paused: state.paused,
     dryRun: state.config.dryRun,
     uptime: `${Math.floor((Date.now() - startedAt) / 60000)}m`,
     price: {
-      btc: priceEngine.lastBinancePrice.toFixed(2),
+      bybit: priceEngine.lastBinancePrice.toFixed(2),
+      chainlink: `$${cl.price.toFixed(2)} (${cl.age}s old)`,
+      windowOpen: wop ? `$${wop.toFixed(2)}` : null,
+      delta: wop ? `$${(priceEngine.lastBinancePrice - wop).toFixed(0)} (${(((priceEngine.lastBinancePrice - wop) / wop) * 100).toFixed(3)}%)` : null,
       timeInWindow: `${timeInWindow}s`,
+      inTradeWindow: timeInWindow >= state.config.entryWindowStart && timeInWindow <= state.config.entryWindowEnd,
     },
-    ticks: tickCount,
-    orders: {
-      active: activeOrders.length,
-      filled: filledOrders.length,
-      activeDetail: activeOrders.map(o => ({
-        window: o.windowStart,
-        direction: o.direction,
-        price: `$${o.bidPrice}`,
-        size: o.size,
-        cost: `$${o.cost.toFixed(2)}`,
-      })),
-    },
+    ticks: { total: tickCount, checks: checkCount },
     stats: {
       trades: state.trades.filter(t => t.result !== "dry-run").length,
-      dryRunTrades: state.trades.filter(t => t.result === "dry-run" || t.result === "win" || t.result === "loss").length,
+      dryRunTrades: state.trades.length,
       wins: state.wins,
       losses: state.losses,
-      pending: state.trades.filter(t => t.result === "pending").length,
+      pending: state.trades.filter(t => t.result === "pending" || t.result === "dry-run").length,
       winRate: state.wins + state.losses > 0
         ? `${((state.wins / (state.wins + state.losses)) * 100).toFixed(1)}%` : "N/A",
       totalPnL: `$${state.totalPnL.toFixed(2)}`,
@@ -764,11 +707,14 @@ app.get("/status", async (_req, res) => {
     recentTrades: state.trades.slice(-5).reverse().map(t => ({
       time: new Date(t.timestamp).toISOString(),
       direction: t.direction,
-      price: `$${t.price}`,
+      price: `$${t.price.toFixed(2)}`,
       size: t.size,
       cost: `$${t.cost.toFixed(2)}`,
       result: t.result,
       pnl: `$${t.pnl.toFixed(2)}`,
+      delta: `$${t.deltaAtEntry?.toFixed(0) ?? "?"}`,
+      timeInWindow: `${t.timeInWindow ?? "?"}s`,
+      chainlink: t.chainlinkPrice ? `$${t.chainlinkPrice.toFixed(2)}` : "N/A",
     })),
   });
 });
@@ -784,17 +730,7 @@ app.get("/wallet", async (_req, res) => {
   });
 });
 
-app.get("/trades", (_req, res) => {
-  res.json(state.trades.slice(-50).reverse());
-});
-
-app.get("/orders", (_req, res) => {
-  res.json({
-    active: state.activeOrders.filter(o => o.status === "placed"),
-    filled: state.activeOrders.filter(o => o.status === "filled").slice(-20),
-    canceled: state.activeOrders.filter(o => o.status === "canceled" || o.status === "expired").slice(-20),
-  });
-});
+app.get("/trades", (_req, res) => res.json(state.trades.slice(-50).reverse()));
 
 app.get("/stats/hourly", (_req, res) => {
   const hourly: Record<number, { trades: number; wins: number; losses: number; pnl: number }> = {};
@@ -841,7 +777,7 @@ app.post("/resume", (_req, res) => {
 });
 
 app.post("/config", (req, res) => {
-  const allowed = Object.keys(DEFAULT_PANIC_CONFIG);
+  const allowed = Object.keys(DEFAULT_CONFIG);
   const applied: Record<string, any> = {};
   for (const key of allowed) {
     if (key in req.body) {
@@ -862,20 +798,25 @@ app.post("/stop", (_req, res) => {
 // ── Lifecycle ───────────────────────────────────────────────
 async function start() {
   console.log("═══════════════════════════════════════════════");
-  console.log("  Polymarket BTC 5-Min Bot v7 — Panic Catcher");
+  console.log("  Polymarket BTC 5-Min Bot v8 — Last Look");
   console.log(`  Mode: ${state.config.dryRun ? "🏜️ DRY RUN" : "💰 LIVE"}`);
-  console.log(`  Bid price: $${state.config.bidPrice}/token`);
-  console.log(`  Size per side: $${state.config.sizePerSide}`);
-  console.log(`  Max exposure: $${state.config.maxTotalExposure}`);
+  console.log(`  Entry window: ${state.config.entryWindowStart}-${state.config.entryWindowEnd}s (last ${300 - state.config.entryWindowStart}s)`);
+  console.log(`  Min delta: $${state.config.minDeltaAbsolute} / ${state.config.minDeltaPercent}%`);
+  console.log(`  Max entry price: $${state.config.maxEntryPrice}`);
+  console.log(`  Position: ${(state.config.compoundFraction * 100).toFixed(0)}% of wallet ($${state.config.positionSize}-$${state.config.maxPositionSize})`);
+  console.log(`  Chainlink confirm: ${state.config.requireChainlinkConfirm ? "ON" : "OFF"}`);
   console.log(`  P&L floor: $${state.config.pnlFloor}`);
   console.log(`  History: ${state.trades.length} trades, ${state.wins}W/${state.losses}L, $${state.totalPnL.toFixed(2)} P&L`);
   console.log("═══════════════════════════════════════════════\n");
+
+  // Test Chainlink feed
+  const cl = await getChainlinkPrice();
+  console.log(`[chainlink] BTC/USD on Polygon: $${cl.price.toFixed(2)} (${cl.age}s old) ✅`);
 
   if (!state.config.dryRun) {
     clobClient = await initClobClient();
   }
 
-  // Session start balance
   if (state.sessionStartBalance != null && state.sessionStartBalance > 0) {
     console.log(`[bot] Session start balance (preserved): $${state.sessionStartBalance.toFixed(2)}`);
   } else {
