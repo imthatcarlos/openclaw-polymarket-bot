@@ -17,14 +17,31 @@ export interface Candle {
   final: boolean;
 }
 
+export interface PolymarketBook {
+  upBestBid: number;
+  upBestAsk: number;
+  downBestBid: number;
+  downBestAsk: number;
+  upAskDepth: number;
+  downAskDepth: number;
+  lastUpdate: number;
+}
+
 export class PriceEngine extends EventEmitter {
   private bybitWs: WebSocket | null = null;
+  private polyWs: WebSocket | null = null;
+  private polySubscribedTokens: string[] = [];
   private candles: Candle[] = [];
   private maxCandles = 120; // 2 hours of 1-min candles
   public lastBinancePrice = 0; // keeping field name for compat
   public lastChainlinkPrice = 0;
   public lastPriceTime = 0;
-  public connected = { binance: false, chainlink: false };
+  public connected = { binance: false, chainlink: false, polymarket: false };
+  public polyBook: PolymarketBook = {
+    upBestBid: 0, upBestAsk: 0, downBestBid: 0, downBestAsk: 0,
+    upAskDepth: 0, downAskDepth: 0, lastUpdate: 0,
+  };
+  private polyTokenMap: Map<string, "UP" | "DOWN"> = new Map();
 
   async bootstrap() {
     // Seed with REST data from Binance.us (REST still works, just WS is dead)
@@ -168,6 +185,124 @@ export class PriceEngine extends EventEmitter {
   }
 
   /**
+   * Polymarket CLOB WebSocket — real-time orderbook updates for current market
+   * Public channel, no auth needed, not geo-blocked
+   */
+  connectPolymarket() {
+    const url = "wss://ws-subscriptions-clob.polymarket.com/ws/market";
+    console.log("[price] Connecting to Polymarket CLOB WebSocket...");
+
+    const connect = () => {
+      this.polyWs = new WebSocket(url);
+
+      this.polyWs.on("open", () => {
+        console.log("[price] Polymarket WS connected");
+        this.connected.polymarket = true;
+        // Re-subscribe if we had tokens
+        if (this.polySubscribedTokens.length > 0) {
+          this.polyWs!.send(JSON.stringify({
+            type: "market",
+            assets_ids: this.polySubscribedTokens,
+          }));
+          console.log(`[price] Re-subscribed to ${this.polySubscribedTokens.length} tokens`);
+        }
+      });
+
+      this.polyWs.on("message", (data: Buffer) => {
+        try {
+          const msgs = JSON.parse(data.toString());
+          // Can be a single message or array
+          const msgArr = Array.isArray(msgs) ? msgs : [msgs];
+          
+          for (const msg of msgArr) {
+            if (msg.event_type === "price_change" && msg.price_changes) {
+              for (const pc of msg.price_changes) {
+                const direction = this.polyTokenMap.get(pc.asset_id);
+                if (!direction) continue;
+                
+                const bestBid = parseFloat(pc.best_bid || "0");
+                const bestAsk = parseFloat(pc.best_ask || "0");
+                
+                if (direction === "UP") {
+                  if (bestBid > 0) this.polyBook.upBestBid = bestBid;
+                  if (bestAsk > 0) this.polyBook.upBestAsk = bestAsk;
+                } else {
+                  if (bestBid > 0) this.polyBook.downBestBid = bestBid;
+                  if (bestAsk > 0) this.polyBook.downBestAsk = bestAsk;
+                }
+                this.polyBook.lastUpdate = Date.now();
+              }
+              this.emit("polybook", this.polyBook);
+            } else if (msg.event_type === "book") {
+              const direction = this.polyTokenMap.get(msg.asset_id);
+              if (!direction) continue;
+              
+              const asks = msg.asks || [];
+              if (asks.length > 0) {
+                // Best ask = lowest price
+                const sorted = asks.map((a: any) => ({ price: parseFloat(a.price), size: parseFloat(a.size) }))
+                  .sort((a: any, b: any) => a.price - b.price);
+                if (direction === "UP") {
+                  this.polyBook.upBestAsk = sorted[0].price;
+                  this.polyBook.upAskDepth = sorted[0].size;
+                } else {
+                  this.polyBook.downBestAsk = sorted[0].price;
+                  this.polyBook.downAskDepth = sorted[0].size;
+                }
+              }
+              const bids = msg.bids || [];
+              if (bids.length > 0) {
+                const bestBid = Math.max(...bids.map((b: any) => parseFloat(b.price)));
+                if (direction === "UP") this.polyBook.upBestBid = bestBid;
+                else this.polyBook.downBestBid = bestBid;
+              }
+              this.polyBook.lastUpdate = Date.now();
+              this.emit("polybook", this.polyBook);
+            }
+          }
+        } catch (e) {
+          // ignore parse errors
+        }
+      });
+
+      this.polyWs.on("close", () => {
+        console.log("[price] Polymarket WS disconnected. Reconnecting in 3s...");
+        this.connected.polymarket = false;
+        setTimeout(connect, 3000);
+      });
+
+      this.polyWs.on("error", (err: Error) => {
+        console.error("[price] Polymarket WS error:", err.message);
+      });
+    };
+
+    connect();
+  }
+
+  /**
+   * Subscribe to a new market's tokens for real-time orderbook updates
+   */
+  subscribeMarket(upTokenId: string, downTokenId: string) {
+    this.polyTokenMap.set(upTokenId, "UP");
+    this.polyTokenMap.set(downTokenId, "DOWN");
+    this.polySubscribedTokens = [upTokenId, downTokenId];
+    
+    // Reset book state for new market
+    this.polyBook = {
+      upBestBid: 0, upBestAsk: 0, downBestBid: 0, downBestAsk: 0,
+      upAskDepth: 0, downAskDepth: 0, lastUpdate: 0,
+    };
+
+    if (this.polyWs?.readyState === WebSocket.OPEN) {
+      this.polyWs.send(JSON.stringify({
+        type: "market",
+        assets_ids: [upTokenId, downTokenId],
+      }));
+      console.log(`[price] Subscribed to Polymarket market tokens`);
+    }
+  }
+
+  /**
    * CoinGecko polling as cross-check (every 30s)
    */
   private cgInterval: ReturnType<typeof setInterval> | null = null;
@@ -216,6 +351,8 @@ export class PriceEngine extends EventEmitter {
   stop() {
     this.bybitWs?.close();
     this.bybitWs = null;
+    this.polyWs?.close();
+    this.polyWs = null;
     if (this.cgInterval) clearInterval(this.cgInterval);
   }
 }

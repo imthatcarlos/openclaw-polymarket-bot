@@ -372,8 +372,25 @@ async function onTick(price: number) {
     const market = await findCurrentMarket();
     if (!market) { checking = false; return; }
 
-    // Log orderbook state
-    console.log(`[book] UP: bid=$${market.upBestBid} ask=$${market.upBestAsk}(${market.upAskDepth.toFixed(0)}) | DOWN: bid=$${market.downBestBid} ask=$${market.downBestAsk}(${market.downAskDepth.toFixed(0)}) | mid: UP=$${market.upPrice} DOWN=$${market.downPrice}`);
+    // Subscribe to Polymarket WS for this market's tokens (idempotent per window)
+    priceEngine.subscribeMarket(market.upTokenId, market.downTokenId);
+
+    // Use live Polymarket WS orderbook if available, else fall back to REST data
+    const pb = priceEngine.polyBook;
+    const bookAge = Date.now() - pb.lastUpdate;
+    if (pb.lastUpdate > 0 && bookAge < 10000) {
+      // Live data from Polymarket WS (< 10s old)
+      market.upBestAsk = pb.upBestAsk;
+      market.downBestAsk = pb.downBestAsk;
+      market.upBestBid = pb.upBestBid;
+      market.downBestBid = pb.downBestBid;
+      market.upAskDepth = pb.upAskDepth;
+      market.downAskDepth = pb.downAskDepth;
+      console.log(`[book] LIVE UP: bid=$${pb.upBestBid} ask=$${pb.upBestAsk} | DOWN: bid=$${pb.downBestBid} ask=$${pb.downBestAsk} | mid: UP=$${market.upPrice} DOWN=$${market.downPrice} (${bookAge}ms ago)`);
+    } else {
+      // Fallback to REST-fetched data from market engine
+      console.log(`[book] REST UP: bid=$${market.upBestBid} ask=$${market.upBestAsk}(${market.upAskDepth.toFixed(0)}) | DOWN: bid=$${market.downBestBid} ask=$${market.downBestAsk}(${market.downAskDepth.toFixed(0)}) | mid: UP=$${market.upPrice} DOWN=$${market.downPrice}`);
+    }
 
     // Generate signal
     const signal = generateSignal(
@@ -743,9 +760,10 @@ async function start() {
 
   await priceEngine.bootstrap();
   priceEngine.connectBinance();
+  priceEngine.connectPolymarket();
   priceEngine.startCoinGeckoPolling();
 
-  // Event-driven: check on every price tick from Binance WebSocket
+  // Event-driven: check on every price tick from Bybit WebSocket
   priceEngine.on("tick", ({ source, price }: { source: string; price: number }) => {
     if (source === "binance") {
       onTick(price);

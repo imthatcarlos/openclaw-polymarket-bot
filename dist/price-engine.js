@@ -7,12 +7,19 @@ import WebSocket from "ws";
 import { EventEmitter } from "events";
 export class PriceEngine extends EventEmitter {
     bybitWs = null;
+    polyWs = null;
+    polySubscribedTokens = [];
     candles = [];
     maxCandles = 120; // 2 hours of 1-min candles
     lastBinancePrice = 0; // keeping field name for compat
     lastChainlinkPrice = 0;
     lastPriceTime = 0;
-    connected = { binance: false, chainlink: false };
+    connected = { binance: false, chainlink: false, polymarket: false };
+    polyBook = {
+        upBestBid: 0, upBestAsk: 0, downBestBid: 0, downBestAsk: 0,
+        upAskDepth: 0, downAskDepth: 0, lastUpdate: 0,
+    };
+    polyTokenMap = new Map();
     async bootstrap() {
         // Seed with REST data from Binance.us (REST still works, just WS is dead)
         console.log("[price] Bootstrapping with Binance REST candles...");
@@ -146,6 +153,122 @@ export class PriceEngine extends EventEmitter {
         connect();
     }
     /**
+     * Polymarket CLOB WebSocket — real-time orderbook updates for current market
+     * Public channel, no auth needed, not geo-blocked
+     */
+    connectPolymarket() {
+        const url = "wss://ws-subscriptions-clob.polymarket.com/ws/market";
+        console.log("[price] Connecting to Polymarket CLOB WebSocket...");
+        const connect = () => {
+            this.polyWs = new WebSocket(url);
+            this.polyWs.on("open", () => {
+                console.log("[price] Polymarket WS connected");
+                this.connected.polymarket = true;
+                // Re-subscribe if we had tokens
+                if (this.polySubscribedTokens.length > 0) {
+                    this.polyWs.send(JSON.stringify({
+                        type: "market",
+                        assets_ids: this.polySubscribedTokens,
+                    }));
+                    console.log(`[price] Re-subscribed to ${this.polySubscribedTokens.length} tokens`);
+                }
+            });
+            this.polyWs.on("message", (data) => {
+                try {
+                    const msgs = JSON.parse(data.toString());
+                    // Can be a single message or array
+                    const msgArr = Array.isArray(msgs) ? msgs : [msgs];
+                    for (const msg of msgArr) {
+                        if (msg.event_type === "price_change" && msg.price_changes) {
+                            for (const pc of msg.price_changes) {
+                                const direction = this.polyTokenMap.get(pc.asset_id);
+                                if (!direction)
+                                    continue;
+                                const bestBid = parseFloat(pc.best_bid || "0");
+                                const bestAsk = parseFloat(pc.best_ask || "0");
+                                if (direction === "UP") {
+                                    if (bestBid > 0)
+                                        this.polyBook.upBestBid = bestBid;
+                                    if (bestAsk > 0)
+                                        this.polyBook.upBestAsk = bestAsk;
+                                }
+                                else {
+                                    if (bestBid > 0)
+                                        this.polyBook.downBestBid = bestBid;
+                                    if (bestAsk > 0)
+                                        this.polyBook.downBestAsk = bestAsk;
+                                }
+                                this.polyBook.lastUpdate = Date.now();
+                            }
+                            this.emit("polybook", this.polyBook);
+                        }
+                        else if (msg.event_type === "book") {
+                            const direction = this.polyTokenMap.get(msg.asset_id);
+                            if (!direction)
+                                continue;
+                            const asks = msg.asks || [];
+                            if (asks.length > 0) {
+                                // Best ask = lowest price
+                                const sorted = asks.map((a) => ({ price: parseFloat(a.price), size: parseFloat(a.size) }))
+                                    .sort((a, b) => a.price - b.price);
+                                if (direction === "UP") {
+                                    this.polyBook.upBestAsk = sorted[0].price;
+                                    this.polyBook.upAskDepth = sorted[0].size;
+                                }
+                                else {
+                                    this.polyBook.downBestAsk = sorted[0].price;
+                                    this.polyBook.downAskDepth = sorted[0].size;
+                                }
+                            }
+                            const bids = msg.bids || [];
+                            if (bids.length > 0) {
+                                const bestBid = Math.max(...bids.map((b) => parseFloat(b.price)));
+                                if (direction === "UP")
+                                    this.polyBook.upBestBid = bestBid;
+                                else
+                                    this.polyBook.downBestBid = bestBid;
+                            }
+                            this.polyBook.lastUpdate = Date.now();
+                            this.emit("polybook", this.polyBook);
+                        }
+                    }
+                }
+                catch (e) {
+                    // ignore parse errors
+                }
+            });
+            this.polyWs.on("close", () => {
+                console.log("[price] Polymarket WS disconnected. Reconnecting in 3s...");
+                this.connected.polymarket = false;
+                setTimeout(connect, 3000);
+            });
+            this.polyWs.on("error", (err) => {
+                console.error("[price] Polymarket WS error:", err.message);
+            });
+        };
+        connect();
+    }
+    /**
+     * Subscribe to a new market's tokens for real-time orderbook updates
+     */
+    subscribeMarket(upTokenId, downTokenId) {
+        this.polyTokenMap.set(upTokenId, "UP");
+        this.polyTokenMap.set(downTokenId, "DOWN");
+        this.polySubscribedTokens = [upTokenId, downTokenId];
+        // Reset book state for new market
+        this.polyBook = {
+            upBestBid: 0, upBestAsk: 0, downBestBid: 0, downBestAsk: 0,
+            upAskDepth: 0, downAskDepth: 0, lastUpdate: 0,
+        };
+        if (this.polyWs?.readyState === WebSocket.OPEN) {
+            this.polyWs.send(JSON.stringify({
+                type: "market",
+                assets_ids: [upTokenId, downTokenId],
+            }));
+            console.log(`[price] Subscribed to Polymarket market tokens`);
+        }
+    }
+    /**
      * CoinGecko polling as cross-check (every 30s)
      */
     cgInterval = null;
@@ -186,6 +309,8 @@ export class PriceEngine extends EventEmitter {
     stop() {
         this.bybitWs?.close();
         this.bybitWs = null;
+        this.polyWs?.close();
+        this.polyWs = null;
         if (this.cgInterval)
             clearInterval(this.cgInterval);
     }
