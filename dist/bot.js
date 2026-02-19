@@ -1,8 +1,8 @@
 /**
- * Polymarket BTC 5-Min Trading Bot v8 — "Last Look"
+ * Polymarket BTC 15-Min Trading Bot v8.1 — "Last Look"
  *
- * Strategy: Trade in the LAST 60 seconds of each 5-min window when the
- * outcome is nearly certain. At 240s+, if BTC has moved significantly from
+ * Strategy: Trade in the LAST 120 seconds of each 15-min window when the
+ * outcome is nearly certain. At 780s+, if BTC has moved significantly from
  * the window open price, the settlement direction is almost locked in.
  *
  * We use Bybit real-time price as primary signal and the on-chain Chainlink
@@ -29,8 +29,8 @@ const CTF_ADDRESS = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045";
 const WALLET_ADDRESS = process.env.WALLET_ADDRESS || "0x1a1E1b82Da7E91E9567a40b0f952748b586389F9";
 const CHAINLINK_BTC_USD_POLYGON = "0xc907E116054Ad103354f2D350FD2514433D57F6f";
 const DEFAULT_CONFIG = {
-    entryWindowStart: 240,
-    entryWindowEnd: 290,
+    entryWindowStart: 780,
+    entryWindowEnd: 870,
     minDeltaAbsolute: 50,
     minDeltaPercent: 0.07,
     maxEntryPrice: 0.88,
@@ -196,8 +196,8 @@ async function initClobClient() {
 async function settleTrades() {
     const pending = state.trades.filter(t => t.result === "pending");
     for (const trade of pending) {
-        if (Date.now() / 1000 < trade.windowStart + 360)
-            continue;
+        if (Date.now() / 1000 < trade.windowStart + 960)
+            continue; // 15-min window + 60s buffer
         const winner = await checkMarketOutcome(trade.windowStart);
         if (!winner || winner === "pending")
             continue;
@@ -271,7 +271,7 @@ async function onTick(price) {
         return;
     tickCount++;
     const now = Math.floor(Date.now() / 1000);
-    const currentWindowStart = Math.floor(now / 300) * 300;
+    const currentWindowStart = Math.floor(now / 900) * 900;
     const timeInWindow = now - currentWindowStart;
     // Track window open price
     if (!windowOpenPrices.has(currentWindowStart)) {
@@ -410,7 +410,7 @@ async function onTick(price) {
         const cost = size * bidPrice;
         reasons.push(`Size: ${size} tokens × $${bidPrice.toFixed(2)} = $${cost.toFixed(2)} (${(state.config.compoundFraction * 100).toFixed(0)}% of $${walletBalance.toFixed(0)})`);
         reasons.push(`🎯 LAST LOOK: ${direction} | ${timeInWindow}s in | Δ$${absDelta.toFixed(0)} | CL confirms | Profit margin: ${(profitPerToken * 100).toFixed(0)}¢/token`);
-        console.log(`\n[bot] 🎯 ${direction} | ${size} tokens @ $${bidPrice.toFixed(2)} = $${cost.toFixed(2)} | ${timeInWindow}s into window (${300 - timeInWindow}s left)`);
+        console.log(`\n[bot] 🎯 ${direction} | ${size} tokens @ $${bidPrice.toFixed(2)} = $${cost.toFixed(2)} | ${timeInWindow}s into window (${900 - timeInWindow}s left)`);
         reasons.forEach(r => console.log(`  → ${r}`));
         // ── Execute ──
         const trade = {
@@ -521,8 +521,8 @@ function logSignal(reasons) {
 async function settleDryRuns() {
     const pending = state.trades.filter(t => t.result === "dry-run" && t.windowStart > 0);
     for (const trade of pending) {
-        if (Date.now() / 1000 < trade.windowStart + 360)
-            continue;
+        if (Date.now() / 1000 < trade.windowStart + 960)
+            continue; // 15-min window + 60s buffer
         const winner = await checkMarketOutcome(trade.windowStart);
         if (!winner || winner === "pending")
             continue;
@@ -572,7 +572,7 @@ const app = express();
 app.use(express.json());
 app.get("/status", async (_req, res) => {
     const nowSec = Math.floor(Date.now() / 1000);
-    const cwStart = Math.floor(nowSec / 300) * 300;
+    const cwStart = Math.floor(nowSec / 900) * 900;
     const timeInWindow = nowSec - cwStart;
     const wop = windowOpenPrices.get(cwStart);
     const wallet = await getWalletBalance();
@@ -580,7 +580,7 @@ app.get("/status", async (_req, res) => {
         ? wallet - state.sessionStartBalance : null;
     const cl = await getChainlinkPrice();
     res.json({
-        version: "v8-last-look",
+        version: "v8.1-last-look-15m",
         running: true,
         paused: state.paused,
         dryRun: state.config.dryRun,
@@ -701,7 +701,7 @@ async function start() {
     console.log("═══════════════════════════════════════════════");
     console.log("  Polymarket BTC 5-Min Bot v8 — Last Look");
     console.log(`  Mode: ${state.config.dryRun ? "🏜️ DRY RUN" : "💰 LIVE"}`);
-    console.log(`  Entry window: ${state.config.entryWindowStart}-${state.config.entryWindowEnd}s (last ${300 - state.config.entryWindowStart}s)`);
+    console.log(`  Entry window: ${state.config.entryWindowStart}-${state.config.entryWindowEnd}s (last ${900 - state.config.entryWindowStart}s)`);
     console.log(`  Min delta: $${state.config.minDeltaAbsolute} / ${state.config.minDeltaPercent}%`);
     console.log(`  Max entry price: $${state.config.maxEntryPrice}`);
     console.log(`  Position: ${(state.config.compoundFraction * 100).toFixed(0)}% of wallet ($${state.config.positionSize}-$${state.config.maxPositionSize})`);

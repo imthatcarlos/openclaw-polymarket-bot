@@ -15,12 +15,12 @@ async function proxiedFetch(targetUrl) {
 }
 export async function findCurrentMarket() {
     const now = Math.floor(Date.now() / 1000);
-    const currentWindowStart = Math.floor(now / 300) * 300;
+    const currentWindowStart = Math.floor(now / 900) * 900;
     const timeIntoWindow = now - currentWindowStart;
     // Only trade current window, skip if >4 min in (arb can trade later)
     if (timeIntoWindow > 295)
         return null; // Allow trades up to 295s (v8 Last Look needs 240-290s)
-    const slug = `btc-updown-5m-${currentWindowStart}`;
+    const slug = `btc-updown-15m-${currentWindowStart}`;
     try {
         const res = await proxiedFetch(`${GAMMA_BASE}/events/slug/${slug}`);
         if (!res.ok)
@@ -86,7 +86,7 @@ export async function findCurrentMarket() {
             conditionId: market.conditionId,
             endDate: market.endDate,
             windowStart: currentWindowStart,
-            windowEnd: currentWindowStart + 300,
+            windowEnd: currentWindowStart + 900,
             upTokenId,
             downTokenId,
             upPrice: upMid,
@@ -109,7 +109,7 @@ export async function findCurrentMarket() {
  * outcomePrices: ["1","0"] = Up won, ["0","1"] = Down won
  */
 export async function checkMarketOutcome(windowStart) {
-    const slug = `btc-updown-5m-${windowStart}`;
+    const slug = `btc-updown-15m-${windowStart}`;
     try {
         const res = await proxiedFetch(`${GAMMA_BASE}/events/slug/${slug}`);
         if (!res.ok)
