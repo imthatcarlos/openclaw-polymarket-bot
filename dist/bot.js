@@ -332,6 +332,16 @@ async function onTick(price) {
                 checking = false;
                 return;
             }
+            // Require CL delta to be at least 50% of Bybit delta — weak CL = unreliable move
+            const clDeltaRatio = Math.abs(clDelta) / Math.abs(delta);
+            if (clDeltaRatio < 0.5) {
+                reasons.push(`SKIP: Chainlink delta too weak (${(clDeltaRatio * 100).toFixed(0)}% of Bybit, need ≥50%) | CL Δ: $${Math.abs(clDelta).toFixed(0)} vs Bybit Δ: $${Math.abs(delta).toFixed(0)}`);
+                logSignal(reasons);
+                state.skips++;
+                checking = false;
+                return;
+            }
+            reasons.push(`CL delta ratio: ${(clDeltaRatio * 100).toFixed(0)}% of Bybit ✅`);
         }
         // ── Get market + orderbook ──
         const market = await findCurrentMarket();
