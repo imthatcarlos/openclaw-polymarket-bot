@@ -423,9 +423,9 @@ async function onTick(price: number) {
         checking = false;
         return;
       }
-      // Require CL delta to be at least 50% of Bybit delta — weak CL = unreliable move
+      // Require CL delta to be at least 35% of Bybit delta — lowered for 15-min windows where CL lags more
       const clDeltaRatio = Math.abs(clDelta) / Math.abs(delta);
-      if (clDeltaRatio < 0.5) {
+      if (clDeltaRatio < 0.35) {
         reasons.push(`SKIP: Chainlink delta too weak (${(clDeltaRatio * 100).toFixed(0)}% of Bybit, need ≥50%) | CL Δ: $${Math.abs(clDelta).toFixed(0)} vs Bybit Δ: $${Math.abs(delta).toFixed(0)}`);
         logSignal(reasons);
         state.skips++;
